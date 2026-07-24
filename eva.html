@@ -430,11 +430,13 @@
     float scan  = 0.5 + 0.5*sin(uv.y*150.0 - t*4.0);       // holo scanlines
     // interior is a soft gradient (brighter toward the rim) -> the field breathes,
     // background still reads through it, no blown-out solid slab
-    vec3 col  = u_figA * fill * (0.14 + depth*0.42) * (0.6 + u_bass*0.6);
-    col += u_figA * fill * scan * 0.07;                     // faint scan texture
-    col += u_figB * edge * (1.2 + u_beat*1.0);              // bright rim
-    col += vec3(1.0,0.97,0.9) * smoothstep(0.004,0.0,abs(sdf)) * 0.55;  // hot core line
-    return col * u_coh;
+    // kept subtle: a ghostly form layered INSIDE the web, never dominating it --
+    // this is a music visualizer first, the shape is just an accent.
+    vec3 col  = u_figA * fill * (0.06 + depth*0.18) * (0.5 + u_bass*0.5);
+    col += u_figA * fill * scan * 0.05;                     // faint scan texture
+    col += u_figB * edge * (0.55 + u_beat*0.5);             // soft outline
+    col += vec3(1.0,0.97,0.9) * smoothstep(0.004,0.0,abs(sdf)) * 0.28;  // faint core line
+    return col * u_coh * 0.7;
   }
 
   vec3 scene(vec2 uv, float t){
@@ -457,7 +459,7 @@
     vec3 hexCol = mix(u_c2, u_c1, clamp(f*1.6 + u_beat*0.5, 0.0, 1.0));
     hexCol = hueShift(hexCol, sin(cellR*0.30 + t*0.20)*0.16 + f*0.25); // subtle shimmer
     // AT-field recedes as the web coalesces into a silhouette, so the figure reads
-    float hexDim = 1.0 - u_coh*0.72;
+    float hexDim = 1.0 - u_coh*0.4;
     col += hexCol * glow * hexDim;
     // fill a cell only when its band is strong (f squared -> nothing at idle)
     col += hexCol * smoothstep(0.30, 0.46, hc.y) * f*f * 0.5 * hexDim;
@@ -523,7 +525,7 @@
     // neural web stays readable: dims far less than the background (0.7 -> ~30% of the dimming)
     // ...but as the figure coalesces the web RECEDES so the solid silhouette dominates
     // (fixes the old "sync high = unreadable bright blob").
-    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7) * (1.0 - u_coh*0.85);
+    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7) * (1.0 - u_coh*0.30) * 1.2;
     net *= (1.0 + u_coil*0.35 + u_burst*0.6);          // tension glows; release flashes
     vec3 fig = figure(uv, t);
     vec3 col = scn + net + fig;
