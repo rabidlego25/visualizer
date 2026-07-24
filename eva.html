@@ -846,6 +846,25 @@
   // ---------------- NERV HUD (2D overlay) ----------------
   const glyphCols = 40;
   let scrollY = 0;
+  // named readout: the MAGI "reads" the track in real time from the envelope signals.
+  // Priority events (drop/build) interrupt instantly; steady states hold ~0.5s so the
+  // label doesn't strobe. Returns a short status string for the HUD.
+  let hudLabel = 'SYSTEM NOMINAL', hudLabelP = 0, hudLabelT = 0;
+  function musicReadout(a, now){
+    const tot = a.bass + a.mid + a.treb + 1e-3;
+    let label, pri;
+    if (burst > 0.4)              { label='RELEASE // DROP';  pri=5; }
+    else if (coil > 0.5)          { label='TENSION RISING';   pri=4; }
+    else if (coil > 0.25)         { label='CHARGING';         pri=3; }
+    else if (energyFast < 0.12)   { label='SIGNAL LOW';       pri=3; }
+    else if (a.treb/tot > 0.42)   { label='HARMONIC BLOOM';   pri=1; }
+    else if (a.bass/tot > 0.55)   { label='SUB-BASS SURGE';   pri=1; }
+    else                          { label='PATTERN LOCKED';   pri=1; }
+    if (label !== hudLabel){
+      if (pri > hudLabelP || now - hudLabelT > 550){ hudLabel = label; hudLabelP = pri; hudLabelT = now; }
+    } else { hudLabelP = pri; hudLabelT = now; }
+    return hudLabel;
+  }
   function drawHUD(a, now){
     const th = THEMES[+themeSel.value];
     const amber = th.hud;
@@ -872,7 +891,12 @@
     vctx.font = `${Math.round(11*s)}px "Courier New", monospace`;
     vctx.fillStyle = 'rgba(255,206,158,0.7)';
     vctx.fillText('MAGI SYSTEM // CASPER-3', m+14*s, m+40*s);
-    vctx.fillText('EMERGENCY MODE : STANDBY', m+14*s, m+56*s);
+    // live named readout: the MAGI reads the track. Hot color on drop/release.
+    const readout = musicReadout(a, now);
+    const hot = (burst > 0.4 || coil > 0.5);
+    vctx.fillStyle = hot ? '#ffd24a' : 'rgba(255,206,158,0.7)';
+    vctx.fillText('READ : ' + readout, m+14*s, m+56*s);
+    vctx.fillStyle = 'rgba(255,206,158,0.7)';
 
     // top-right SYNC ratio (living gauge; +tiny readout jitter so it looks live)
     const sync = Math.min(0.999, syncRatio + (Math.random()-0.5)*0.0015);
