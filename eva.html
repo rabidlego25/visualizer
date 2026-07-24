@@ -138,7 +138,7 @@
         </select>
       </label>
       <button id="netBtn" class="primary">🧠 Neural</button>
-      <label class="field">Nodes <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.7"></label>
+      <label class="field">Nodes <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.8"></label>
       <button id="safeBtn" title="Reduce flashing & motion">🕊 Calm</button>
     </div>
     <div class="sep"></div>
@@ -498,9 +498,11 @@
     float t = u_time;
     // beat "punch": zoom + rotation kick on every hit for kinetic impact; the
     // release adds a brief outward pop so the drop lands physically.
-    uv /= (1.0 + (u_beat*0.08 + u_burst*0.05 + u_coil*0.04)*u_safe);   // whole view breathes with the song
-    float rk = u_beat*0.03*u_safe;
+    uv /= (1.0 + (u_beat*0.15 + u_burst*0.06 + u_coil*0.04)*u_safe);   // profound beats punch harder
+    float rk = u_beat*0.055*u_safe;                                    // rotation snap on the hit
     uv = mat2(cos(rk),-sin(rk),sin(rk),cos(rk)) * uv;
+    // brief shake -- beat*beat so only the heavy hits shake, soft ticks barely move
+    uv += vec2(sin(t*133.0), cos(t*149.0)) * (u_beat*u_beat*0.012) * u_safe;
 
     // chromatic aberration (base always on; beat surge gated by safe mode)
     float ca = 0.004 + u_beat*0.018*u_safe;
@@ -617,8 +619,14 @@
     const mid  = Math.min(rawM*g, 1.4);
     const treb = Math.min(rawT*g, 1.4);
     bassSmooth = bassSmooth*0.92 + bass*0.08;
-    if (bass > bassSmooth*1.3 && bass > 0.32 && now-lastBeat>170) { beat=1; lastBeat=now; }
-    beat *= 0.90;
+    if (bass > bassSmooth*1.28 && bass > 0.30 && now-lastBeat>150) {
+      // the beat carries its STRENGTH: a profound kick punches far above the running
+      // baseline -> a big beat -> dramatic movement; a soft tick stays small.
+      const strength = Math.min(1.0, (bass - bassSmooth) / (bassSmooth*0.9 + 0.12));
+      beat = Math.max(beat, 0.4 + strength*0.85);   // ~0.4 (soft) .. ~1.25 (profound)
+      lastBeat = now;
+    }
+    beat *= 0.88;
     const energy = (bass*0.6+mid*0.3+treb*0.1);
     // ---- breathing (in / out) ----
     energyFast = energyFast*0.80 + energy*0.20;      // the moment
@@ -660,7 +668,7 @@
     for (let i=0;i<N;i++){
       const ring = i < ringN;
       const ang  = ring ? (i/ringN)*Math.PI*2 : Math.random()*Math.PI*2;
-      const rad  = ring ? 0.86 : Math.random()*0.6;     // logical [-1,1] space
+      const rad  = ring ? 0.9 : Math.random()*0.82;     // logical [-1,1] space (fuller spread)
       netNodes.push({
         hx: Math.cos(ang)*rad, hy: Math.sin(ang)*rad,
         x:0, y:0, phase: Math.random()*Math.PI*2,
@@ -688,7 +696,7 @@
       }
     }
   }
-  initNet(26);
+  initNet(32);
   // Slider 0..1 -> node count with a gentle ("tepid") logarithmic curve:
   // fine control over small counts, quicker growth toward the top.
   function sliderToNodes(s){
@@ -721,7 +729,7 @@
   let testCoh = null;   // harness override so silhouettes can be screenshotted
 
   function updateNet(dt, gain){
-    const hw = 0.5*W/H*0.92, hh = 0.5*0.92;   // uv half-extents
+    const hw = 0.5*W/H*1.1, hh = 0.5*1.1;   // uv half-extents (web spreads across the frame)
     // syncRatio gently swells/settles the whole web's energy on its own -- the
     // automatic version of nudging the "Sync" slider. Manual gain still stacks on top.
     const syncGain = 0.65 + syncRatio*0.7;
@@ -733,7 +741,10 @@
     coh += (cohTar - coh) * (cohTar > coh ? 0.06 : 0.03);    // ease in faster than out
     if (beat > 0.6) coh = Math.min(1, coh + 0.12);
     shapeDwell += dt;
-    if (coh > 0.62 && beat > 0.6 && shapeDwell > 2.6){
+    // evolve the form: morph on a strong beat after a short dwell, AND force-advance on
+    // a timer so it never sits on one shape for a whole song (the old rule needed a rare
+    // high-coalescence beat, so quiet samples stayed frozen).
+    if ((beat > 0.55 && shapeDwell > 1.6) || shapeDwell > 5.0){
       shapeIdx = (shapeIdx + 1) % SHAPES.length; shapeDwell = 0;
     }
     if (testCoh != null) coh = testCoh;
@@ -747,14 +758,14 @@
     for (let i=0;i<netNodes.length;i++){
       const n = netNodes[i];
       n.e = freqData ? Math.min((freqData[n.band]/255)*gain*syncGain, 1.3) : 0;
-      n.phase += dt * n.spd * (1 + n.e*1.5 + beat*2.5);
+      n.phase += dt * n.spd * (1 + n.e*1.5 + beat*4.0);   // profound beats agitate the web harder
       // web stays free (no stick-figure snapping); as the figure forms it gently
       // converges inward and the shader fades the web out, leaving the solid figure.
       // breathing acts on each node's LOCAL drift around its own home -- NOT a global
       // pull to center -- so the web stays spread across the frame and shows behavior
       // throughout. coil tightens the drift into a taut, trembling lattice; burst jolts
       // each node outward from its home (dispersal), then it settles.
-      const rr = (n.r*(1 + n.e*0.9) + beat*0.05) * (1 - coil*0.6) * (1 + burst*2.2);
+      const rr = (n.r*(1 + n.e*0.9) + beat*beat*0.10) * (1 - coil*0.6) * (1 + burst*2.2);
       const gather = 1 - coh*0.30;                     // mild inward pull only while a figure forms
       let bx = n.hx*hw*gather + Math.cos(n.phase)*rr;
       let by = n.hy*hh*gather + Math.sin(n.phase*1.3)*rr;
