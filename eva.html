@@ -143,6 +143,11 @@
     </div>
     <div class="sep"></div>
     <div class="group">
+      <button id="fpBtn" title="Song fingerprint — a unique portrait of this track">◎ Print</button>
+      <button id="fpSaveBtn" title="Download the fingerprint as a PNG">⤓ Save</button>
+    </div>
+    <div class="sep"></div>
+    <div class="group">
       <button id="recBtn" class="rec" disabled>● Rec</button>
       <span id="recDot"></span>
       <span id="timer">0:00</span>
@@ -177,6 +182,8 @@
   const netBtn    = document.getElementById('netBtn');
   const safeBtn   = document.getElementById('safeBtn');
   const nodeSlider= document.getElementById('nodeSlider');
+  const fpBtn     = document.getElementById('fpBtn');
+  const fpSaveBtn = document.getElementById('fpSaveBtn');
   const seekbar   = document.getElementById('seekbar');
   const seek      = document.getElementById('seek');
   const curTime   = document.getElementById('curTime');
@@ -239,6 +246,7 @@
     sourceNode = mediaElSrc;
     connect(sourceNode, true);
     playBtn.disabled=false; recBtn.disabled=false;
+    fpReset(file.name);
     hint.classList.add('hidden'); startLoop(); play();
   }
   async function useMic() {
@@ -251,6 +259,7 @@
       playBtn.disabled=true; recBtn.disabled=false;
       seek.disabled=true; seekbar.classList.add('disabled');
       curTime.textContent=durTime.textContent='0:00';
+      fpReset('LIVE INPUT');
       hint.classList.add('hidden'); startLoop();
     } catch(e) { alert('Microphone access failed: '+e.message); }
   }
@@ -964,8 +973,88 @@
     // composite: GPU frame -> 2D canvas, then HUD on top
     vctx.drawImage(glCanvas, 0, 0, W, H);
     drawHUD(a, now);
+    // accrete the song fingerprint (and, in print mode, show it on top)
+    const songT = (mediaEl && isFinite(mediaEl.currentTime)) ? mediaEl.currentTime : (now-startT)/1000;
+    fpTick(songT);
+    if (fpMode) drawFingerprint();
   }
   function startLoop(){ if (running) return; running=true; startT=performance.now(); requestAnimationFrame(loop); }
+
+  // ---------------- Song fingerprint (persistent per-track portrait) ----------------
+  // A polar spectrogram accreted over the whole track: angle advances with song time
+  // (~one turn per TURN_SECS), radius maps the spectrum (bass inner -> treble outer),
+  // beats leave outer ticks, drops leave bright radial flares. The finished ring is a
+  // unique, screenshot-able portrait of that specific song.
+  const FP_SIZE = 1024, TURN_SECS = 175;
+  const fpCanvas = document.createElement('canvas'); fpCanvas.width = fpCanvas.height = FP_SIZE;
+  const fpctx = fpCanvas.getContext('2d');
+  let fpMode = false, fpName = '', fpLastAngle = -Math.PI/2, fpBeatPk = 0, fpBurstPk = 0;
+  function rgbOf(c, s){ return `rgb(${Math.min(255,c[0]*s*255)|0},${Math.min(255,c[1]*s*255)|0},${Math.min(255,c[2]*s*255)|0})`; }
+  function fpReset(name){
+    fpctx.clearRect(0,0,FP_SIZE,FP_SIZE);
+    fpName = name || ''; fpLastAngle = -Math.PI/2; fpBeatPk = 0; fpBurstPk = 0;
+  }
+  function fpTick(songT){
+    fpBeatPk = Math.max(fpBeatPk, beat); fpBurstPk = Math.max(fpBurstPk, burst);
+    const angle = -Math.PI/2 + (songT/TURN_SECS)*Math.PI*2;
+    if (angle - fpLastAngle < 0.006) return;          // tile slices, avoid over-accumulation
+    fpLastAngle = angle;
+    const th = THEMES[+themeSel.value];
+    const cx = FP_SIZE/2, cy = FP_SIZE/2, R0 = FP_SIZE*0.14, R1 = FP_SIZE*0.46, B = 60, slice = (R1-R0)/B;
+    fpctx.save();
+    fpctx.translate(cx, cy); fpctx.rotate(angle);
+    fpctx.globalCompositeOperation = 'lighter';
+    for (let k=0;k<B;k++){
+      const idx = Math.floor(1 + Math.pow(k/B, 1.7)*480);   // log-ish: lows inner, highs outer
+      const amp = freqData[idx]/255;
+      if (amp < 0.05) continue;
+      const r = R0 + (k/B)*(R1-R0);
+      const mixC = th.c2.map((v,i)=> v + (th.c1[i]-v)*amp);
+      fpctx.fillStyle = rgbOf(mixC, 0.5 + amp*0.5);
+      fpctx.globalAlpha = 0.15 + amp*0.6;
+      fpctx.fillRect(-1.7, -(r+slice), 3.4, slice+1.2);
+    }
+    fpctx.globalAlpha = 1;
+    if (fpBeatPk > 0.4){ fpctx.fillStyle = rgbOf(th.c1, 1); fpctx.fillRect(-1.2, -(R1+14), 2.4, 12); }
+    if (fpBurstPk > 0.15){                              // a drop carves a bright flare through the ring
+      fpctx.fillStyle = `rgba(255,250,238,${Math.min(1, fpBurstPk*0.7)})`;
+      fpctx.fillRect(-1.8, -(R1+26), 3.6, (R1-R0)+30);
+    }
+    fpctx.restore();
+    fpBeatPk = 0; fpBurstPk = 0;
+  }
+  function drawFingerprint(){
+    vctx.save();
+    vctx.fillStyle = 'rgba(6,5,9,0.94)'; vctx.fillRect(0,0,W,H);
+    const s = Math.min(W,H)*0.9, x = (W-s)/2, y = (H-s)/2;
+    vctx.drawImage(fpCanvas, x, y, s, s);
+    const m = Math.round(Math.min(W,H)*0.045);
+    vctx.textAlign = 'left';
+    vctx.fillStyle = '#ffb45a';
+    vctx.font = `600 ${Math.round(m*0.62)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    vctx.fillText('MAGI // ACOUSTIC FINGERPRINT', m, m);
+    vctx.fillStyle = 'rgba(255,180,90,0.75)';
+    vctx.font = `500 ${Math.round(m*0.5)}px ui-monospace, monospace`;
+    vctx.fillText((fpName||'LIVE INPUT').toUpperCase().slice(0,42), m, m + Math.round(m*0.85));
+    vctx.restore();
+  }
+  function fpSave(){
+    const c = document.createElement('canvas'); c.width = c.height = FP_SIZE;
+    const x = c.getContext('2d');
+    x.fillStyle = '#05040a'; x.fillRect(0,0,FP_SIZE,FP_SIZE);
+    x.drawImage(fpCanvas, 0, 0);
+    x.textAlign = 'left';
+    x.fillStyle = '#ffb45a'; x.font = '600 26px ui-monospace, Menlo, monospace';
+    x.fillText('MAGI // ACOUSTIC FINGERPRINT', 44, FP_SIZE-64);
+    x.fillStyle = 'rgba(255,180,90,0.75)'; x.font = '500 20px ui-monospace, monospace';
+    x.fillText((fpName||'LIVE INPUT').toUpperCase().slice(0,44), 44, FP_SIZE-34);
+    c.toBlob(b => {
+      const url = URL.createObjectURL(b);
+      const a = document.createElement('a');
+      a.href = url; a.download = (fpName ? fpName.replace(/\.[^.]+$/,'') : 'song') + '_fingerprint.png';
+      a.click(); setTimeout(()=>URL.revokeObjectURL(url), 4000);
+    }, 'image/png');
+  }
 
   // ---------------- Recording ----------------
   let recorder=null, chunks=[], recStart=0, recTimer=null, recMime='video/webm';
@@ -1017,6 +1106,8 @@
   });
   function reflectSafe(){ safeBtn.classList.toggle('primary', safe); safeBtn.textContent = safe ? '🕊 Calm: On' : '🕊 Calm'; }
   safeBtn.addEventListener('click', () => { safe = !safe; reflectSafe(); });
+  fpBtn.addEventListener('click', () => { fpMode = !fpMode; fpBtn.classList.toggle('primary', fpMode); });
+  fpSaveBtn.addEventListener('click', fpSave);
   nodeSlider.addEventListener('input', () => setNodeCount(sliderToNodes(+nodeSlider.value)));
   // sync button to the OS-default calm state applied at boot
   try { if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) safe = true; } catch(e){}
@@ -1096,6 +1187,29 @@
       // simulate cursor for headless verification: ?mx=..&my=..&md=1 (drag) or &mh=1 (hover)
       mouse.x = tp('mx',0); mouse.y = tp('my',0);
       mouse.down = tp('md',0) > 0.5; mouse.over = mouse.down || tp('mh',0) > 0.5;
+      // headless fingerprint check: synthesize a song, accrete the ring, show it
+      if (P.has('fp')){
+        for (let step=0; step<3000; step++){          // synthesize a song into the ring
+          const prog = step/3000, sT = prog*TURN_SECS;
+          for (let i=0;i<freqData.length;i++){
+            const lo = Math.exp(-i/26)*(0.55+0.45*Math.sin(prog*22+i*0.12));
+            const md = (i>40&&i<220)? (0.25+0.5*prog)*Math.abs(Math.sin(prog*9+i*0.05)) : 0;
+            const hi = (i>=220)? (0.08+0.6*prog)*Math.abs(Math.sin(prog*34+i*0.02)) : 0;
+            freqData[i] = Math.max(0, Math.min(255, (lo+md+hi)*255*(0.4+0.6*Math.abs(Math.sin(prog*5)))));
+          }
+          beat  = (step % 55 < 2) ? 1 : 0;
+          burst = (Math.abs(prog-0.30)<0.004 || Math.abs(prog-0.66)<0.004 || Math.abs(prog-0.9)<0.004) ? 1.2 : 0;
+          fpTick(sT);
+        }
+        fpName = 'DEMO TRACK'; fpMode = true; hint.classList.add('hidden');
+        let _ff = 0;
+        (function fpLoop(){                            // redraw a few frames (survives resize-clear)
+          vctx.fillStyle = '#05040a'; vctx.fillRect(0,0,W,H);
+          drawFingerprint();
+          if (++_ff < 8) requestAnimationFrame(fpLoop);
+        })();
+        return;
+      }
       hint.classList.add('hidden');
       let _tframes = 0;
       (function testLoop(){
