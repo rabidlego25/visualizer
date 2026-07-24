@@ -34,6 +34,8 @@
   #view {
     background: #000;
     border-radius: 6px;
+    cursor: grab;
+    touch-action: none;   /* let us handle drag on touch without scrolling */
     box-shadow: 0 0 0 1px rgba(255,140,26,0.2), 0 24px 70px rgba(0,0,0,0.7),
                 0 0 60px rgba(255,80,20,0.08);
     max-width: 100%; max-height: 100%;
@@ -138,6 +140,7 @@
       </label>
       <label class="field">Sync <input type="range" id="gainSlider" min="0.5" max="3" step="0.1" value="1.5"></label>
       <button id="netBtn" class="primary">🧠 Neural</button>
+      <label class="field">Nodes <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.7"></label>
       <button id="safeBtn" title="Reduce flashing & motion">🕊 Calm</button>
     </div>
     <div class="sep"></div>
@@ -176,6 +179,7 @@
   const timerEl   = document.getElementById('timer');
   const netBtn    = document.getElementById('netBtn');
   const safeBtn   = document.getElementById('safeBtn');
+  const nodeSlider= document.getElementById('nodeSlider');
   const seekbar   = document.getElementById('seekbar');
   const seek      = document.getElementById('seek');
   const curTime   = document.getElementById('curTime');
@@ -292,8 +296,8 @@
   uniform vec3  u_c2;      // base edge color
   uniform sampler2D u_fft; // 1D-ish frequency texture
 
-  const int MAXN = 30;     // neural nodes
-  const int MAXE = 46;     // neural edges
+  const int MAXN = 48;     // neural nodes (hard cap of the uniform array)
+  const int MAXE = 96;     // neural edges
   uniform vec3  u_nodes[MAXN];  // xy = position (uv space), z = energy 0..1
   uniform vec4  u_edges[MAXE];  // (x1,y1) -> (x2,y2); padded entries use x>90
   uniform float u_net;          // neural-net master intensity 0..1
@@ -509,16 +513,21 @@
   }
 
   // ---------------- Neural web (geometry fed to the GPU each frame) ----------------
-  const MAXN = 30, MAXE = 46;
+  const MAXN = 48, MAXE = 96;
   const nodeBuf = new Float32Array(MAXN*3);   // x, y, energy
   const edgeBuf = new Float32Array(MAXE*4);   // x1,y1,x2,y2
+  let currentN = 0;                            // active node count (scalable)
   let netNodes = [], netEdges = [], netOn = true, lastNetT = performance.now();
-  function initNet(){
+  // pointer/drag influence on the neural web (uv-space cursor position)
+  const mouse = { x: 0, y: 0, down: false };
+  function initNet(N){
+    N = Math.max(3, Math.min(MAXN, N|0));
+    currentN = N;
     netNodes = [];
-    const N = 26;
+    const ringN = Math.max(3, Math.floor(N*0.55));      // how many sit on the outer ring
     for (let i=0;i<N;i++){
-      const ring = i < 14;
-      const ang  = ring ? (i/14)*Math.PI*2 : Math.random()*Math.PI*2;
+      const ring = i < ringN;
+      const ang  = ring ? (i/ringN)*Math.PI*2 : Math.random()*Math.PI*2;
       const rad  = ring ? 0.86 : Math.random()*0.6;     // logical [-1,1] space
       netNodes.push({
         hx: Math.cos(ang)*rad, hy: Math.sin(ang)*rad,
@@ -526,7 +535,8 @@
         spd: 0.4 + Math.random()*1.5,                   // rapid drift
         r:   0.02 + Math.random()*0.07,                  // drift radius (uv units)
         band: 2 + Math.floor(Math.pow(i/N,1.6)*200),
-        e: 0
+        e: 0,
+        ox:0, oy:0, ovx:0, ovy:0                         // drag offset + velocity (springy)
       });
     }
     // wire each node to its 2 nearest neighbors (by home position), de-duplicated
@@ -544,15 +554,34 @@
       }
     }
   }
-  initNet();
+  initNet(26);
+  // Slider 0..1 -> node count with a gentle ("tepid") logarithmic curve:
+  // fine control over small counts, quicker growth toward the top.
+  function sliderToNodes(s){
+    const minN = 5, maxN = 46, k = 5;   // k = curvature (1 = linear, higher = more log)
+    return Math.round(minN + (maxN-minN) * (Math.pow(k, s)-1) / (k-1));
+  }
+  function setNodeCount(N){ if (N !== currentN) initNet(N); }
   function updateNet(dt, gain){
     const hw = 0.5*W/H*0.92, hh = 0.5*0.92;   // uv half-extents
     for (const n of netNodes){
       n.e = freqData ? Math.min((freqData[n.band]/255)*gain, 1) : 0;
       n.phase += dt * n.spd * (1 + n.e*1.5 + beat*2.5);
       const rr = n.r*(1 + n.e*0.9) + beat*0.05;
-      n.x = n.hx*hw + Math.cos(n.phase)*rr;
-      n.y = n.hy*hh + Math.sin(n.phase*1.3)*rr;
+      const bx = n.hx*hw + Math.cos(n.phase)*rr;      // base (home + drift)
+      const by = n.hy*hh + Math.sin(n.phase*1.3)*rr;
+      // drag: nodes near the cursor are pulled toward it (falloff by distance),
+      // and light up; a spring + damping snaps them back on release.
+      let tx = 0, ty = 0;
+      if (mouse.down){
+        const dx = mouse.x - bx, dy = mouse.y - by, d = Math.hypot(dx,dy), R = 0.55;
+        if (d < R){ const w = 1 - d/R; tx = dx*w*0.9; ty = dy*w*0.9; n.e = Math.min(1, n.e + w*0.6); }
+      }
+      n.ovx = (n.ovx + (tx - n.ox)*0.18) * 0.86;
+      n.ovy = (n.ovy + (ty - n.oy)*0.18) * 0.86;
+      n.ox += n.ovx; n.oy += n.ovy;
+      n.x = bx + n.ox;
+      n.y = by + n.oy;
     }
     for (let i=0;i<MAXN;i++){
       if (i<netNodes.length){ nodeBuf[i*3]=netNodes[i].x; nodeBuf[i*3+1]=netNodes[i].y; nodeBuf[i*3+2]=netNodes[i].e; }
@@ -753,6 +782,7 @@
   });
   function reflectSafe(){ safeBtn.classList.toggle('primary', safe); safeBtn.textContent = safe ? '🕊 Calm: On' : '🕊 Calm'; }
   safeBtn.addEventListener('click', () => { safe = !safe; reflectSafe(); });
+  nodeSlider.addEventListener('input', () => setNodeCount(sliderToNodes(+nodeSlider.value)));
   // sync button to the OS-default calm state applied at boot
   try { if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) safe = true; } catch(e){}
   reflectSafe();
@@ -762,6 +792,23 @@
   function commitSeek(){ if (mediaEl&&mediaEl.duration) mediaEl.currentTime=(seek.value/1000)*mediaEl.duration; seeking=false; }
   seek.addEventListener('change', commitSeek);
   seek.addEventListener('pointerup', commitSeek);
+
+  // pointer drag over the canvas influences the neural web (mouse + touch)
+  function setMouse(e){
+    const r = view.getBoundingClientRect();
+    const lx = (e.clientX - r.left) / r.width;
+    const ly = (e.clientY - r.top) / r.height;
+    mouse.x = (lx - 0.5) * (W / H);   // uv.x spans ±0.5*aspect
+    mouse.y = (0.5 - ly);             // uv.y spans ±0.5, screen-top is +y
+  }
+  view.addEventListener('pointerdown', e => {
+    mouse.down = true; setMouse(e); view.style.cursor = 'grabbing';
+    try { view.setPointerCapture(e.pointerId); } catch(_){}
+  });
+  view.addEventListener('pointermove', e => { if (mouse.down) setMouse(e); });
+  const endDrag = () => { mouse.down = false; view.style.cursor = 'grab'; };
+  view.addEventListener('pointerup', endDrag);
+  view.addEventListener('pointercancel', endDrag);
 
   ['dragenter','dragover'].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault()));
   document.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if (f&&f.type.startsWith('audio')) loadFile(f); });
@@ -795,6 +842,9 @@
         freqData[i] = Math.max(0, Math.min(255, v|0));
       }
       beat = bt;
+      if (P.has('nodes')) setNodeCount(tp('nodes', currentN)|0);
+      // simulate a drag for headless verification: ?mx=..&my=..&md=1
+      mouse.x = tp('mx',0); mouse.y = tp('my',0); mouse.down = tp('md',0) > 0.5;
       hint.classList.add('hidden');
       let _tframes = 0;
       (function testLoop(){
