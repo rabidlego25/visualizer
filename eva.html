@@ -361,8 +361,28 @@
       vec3 n = u_nodes[i];
       if (n.x > 90.0) continue;
       float nd = length(uv - n.xy);
-      col += mix(u_c2, u_c1, n.z) * smoothstep(0.018 + n.z*0.02, 0.0, nd) * (0.5 + n.z*1.6);
-      col += u_c1 * smoothstep(0.06, 0.0, nd) * n.z * 0.4;   // node halo
+      float en = n.z;                                    // energy (incl. flicker spark)
+      // core dot: pops bigger & brighter with energy + beat ("jump")
+      float coreSz = 0.016 + en*0.03 + u_beat*0.012*u_safe;
+      col += mix(u_c2, u_c1, en) * smoothstep(coreSz, 0.0, nd) * (0.5 + en*2.2);
+      col += u_c1 * smoothstep(0.07, 0.0, nd) * en * 0.5;  // node halo
+      // per-node "gas": a small cloud of drifting sparks + a soft nebula that
+      // breathes with the node's energy. near-field gate keeps it cheap.
+      if (nd < 0.16){
+        float seed = fract(sin(float(i)*7.31)*43758.5453);
+        float hz = 0.0;
+        for (int k=0;k<4;k++){
+          float fk = float(k);
+          float a  = seed*6.2831 + fk*1.9 + t*(0.6 + seed*1.4) + sin(t*1.7 + fk)*0.6;
+          float rad = (0.02 + en*0.06 + u_beat*0.02*u_safe) * (0.5 + fk*0.4);
+          float pd = length(uv - (n.xy + vec2(cos(a), sin(a))*rad));
+          hz += smoothstep(0.012, 0.0, pd);
+        }
+        vec3 gasCol = mix(u_c1, vec3(1.0,0.95,0.85), 0.4);
+        col += gasCol * hz * (0.25 + en*1.5);
+        float haze = smoothstep(0.14, 0.0, nd) - smoothstep(0.05, 0.0, nd);
+        col += mix(u_c2, u_c1, en) * haze * en * 0.6;      // nebular puff
+      }
     }
     return col;
   }
@@ -488,6 +508,11 @@
   // ---------------- Analysis helpers ----------------
   function band(lo,hi){ let s=0,n=0; for(let i=lo;i<hi&&i<freqData.length;i++){s+=freqData[i];n++;} return n? (s/n)/255 : 0; }
   let bassSmooth=0, beat=0, lastBeat=0, syncSmooth=0;
+  // living "sync ratio": tracks energy but breathes with a slow organic wander,
+  // so it reads like a telemetry gauge instead of pinning at 0.999. It also gently
+  // modulates the neural web's energy each frame (the automatic version of nudging
+  // the Sync slider), so the whole scene surges & settles on its own.
+  let syncRatio = 0.6, syncWander = 0;
   // auto-exposure: a slow envelope of overall loudness. Transients spike bright
   // first (adapt hasn't caught up), then brightness settles as it rises.
   let expoAdapt=0;
@@ -509,6 +534,11 @@
     beat *= 0.90;
     const energy = (bass*0.6+mid*0.3+treb*0.1);
     syncSmooth = syncSmooth*0.90 + energy*0.10;
+    // brownian wander (bounded) gives the gauge a live, drifting feel
+    syncWander = Math.max(-1, Math.min(1, syncWander*0.97 + (Math.random()-0.5)*0.06));
+    const target = 0.55 + 0.42*Math.min(1, Math.pow(syncSmooth*1.5, 0.8)) + syncWander*0.04;
+    syncRatio += (target - syncRatio) * 0.07;
+    syncRatio = Math.max(0.35, Math.min(0.999, syncRatio));
     return { bass, mid, treb, energy };
   }
 
@@ -519,7 +549,7 @@
   let currentN = 0;                            // active node count (scalable)
   let netNodes = [], netEdges = [], netOn = true, lastNetT = performance.now();
   // pointer/drag influence on the neural web (uv-space cursor position)
-  const mouse = { x: 0, y: 0, down: false };
+  const mouse = { x: 0, y: 0, down: false, over: false };
   function initNet(N){
     N = Math.max(3, Math.min(MAXN, N|0));
     currentN = N;
@@ -535,8 +565,10 @@
         spd: 0.4 + Math.random()*1.5,                   // rapid drift
         r:   0.02 + Math.random()*0.07,                  // drift radius (uv units)
         band: 2 + Math.floor(Math.pow(i/N,1.6)*200),
-        e: 0,
-        ox:0, oy:0, ovx:0, ovy:0                         // drag offset + velocity (springy)
+        e: 0, ring,                                      // ring nodes are the stable skeleton
+        ox:0, oy:0, ovx:0, ovy:0,                        // drag offset + velocity (springy)
+        vis:1, vtar:1, flash:0,                          // quantum-vacuum life (inner nodes)
+        tflip: 0.5 + Math.random()*3                     // countdown to next pop
       });
     }
     // wire each node to its 2 nearest neighbors (by home position), de-duplicated
@@ -564,33 +596,60 @@
   function setNodeCount(N){ if (N !== currentN) initNet(N); }
   function updateNet(dt, gain){
     const hw = 0.5*W/H*0.92, hh = 0.5*0.92;   // uv half-extents
+    // syncRatio gently swells/settles the whole web's energy on its own -- the
+    // automatic version of nudging the "Sync" slider. Manual gain still stacks on top.
+    const syncGain = 0.65 + syncRatio*0.7;
+    const cf = safe ? 0.4 : 1.0;               // calm mode dampens the vacuum flicker
     for (const n of netNodes){
-      n.e = freqData ? Math.min((freqData[n.band]/255)*gain, 1) : 0;
+      n.e = freqData ? Math.min((freqData[n.band]/255)*gain*syncGain, 1.3) : 0;
       n.phase += dt * n.spd * (1 + n.e*1.5 + beat*2.5);
       const rr = n.r*(1 + n.e*0.9) + beat*0.05;
       const bx = n.hx*hw + Math.cos(n.phase)*rr;      // base (home + drift)
       const by = n.hy*hh + Math.sin(n.phase*1.3)*rr;
-      // drag: nodes near the cursor are pulled toward it (falloff by distance),
-      // and light up; a spring + damping snaps them back on release.
+      // cursor influence: DRAG pulls nodes toward the cursor; a bare HOVER pushes
+      // them away (repulsion). Both use a spring + damping so they settle naturally.
       let tx = 0, ty = 0;
       if (mouse.down){
         const dx = mouse.x - bx, dy = mouse.y - by, d = Math.hypot(dx,dy), R = 0.55;
-        if (d < R){ const w = 1 - d/R; tx = dx*w*0.9; ty = dy*w*0.9; n.e = Math.min(1, n.e + w*0.6); }
+        if (d < R){ const w = 1 - d/R; tx = dx*w*0.9; ty = dy*w*0.9; n.e = Math.min(1.3, n.e + w*0.6); }
+      } else if (mouse.over){
+        const dx = bx - mouse.x, dy = by - mouse.y, d = Math.hypot(dx,dy) || 1e-4, R = 0.4;
+        if (d < R){ const w = 1 - d/R; tx = (dx/d)*w*0.32; ty = (dy/d)*w*0.32; n.e = Math.min(1.3, n.e + w*0.25); }
       }
       n.ovx = (n.ovx + (tx - n.ox)*0.18) * 0.86;
       n.ovy = (n.ovy + (ty - n.oy)*0.18) * 0.86;
       n.ox += n.ovx; n.oy += n.ovy;
       n.x = bx + n.ox;
       n.y = by + n.oy;
+      // quantum-vacuum flicker: inner nodes wink out & back with a bright spark,
+      // popping faster when their own frequency band (or a beat) is hot.
+      if (!n.ring){
+        n.tflip -= dt * (0.5 + n.e*2.2 + beat*2.5) * cf;
+        if (n.tflip <= 0){
+          n.vtar = n.vtar > 0.5 ? 0 : 1;                // toggle presence
+          n.flash = 1;                                  // spark on transition
+          n.tflip = 0.4 + Math.random()*2.6;
+        }
+        n.vis += (n.vtar - n.vis) * Math.min(1, dt*16);  // fast fade in/out
+        n.flash *= 0.85;
+      }
     }
     for (let i=0;i<MAXN;i++){
-      if (i<netNodes.length){ nodeBuf[i*3]=netNodes[i].x; nodeBuf[i*3+1]=netNodes[i].y; nodeBuf[i*3+2]=netNodes[i].e; }
-      else { nodeBuf[i*3]=99; nodeBuf[i*3+1]=99; nodeBuf[i*3+2]=0; }
+      if (i<netNodes.length){ const n = netNodes[i];
+        // rendered energy folds in visibility + the transition spark
+        const z = n.e*n.vis + n.flash*0.9*cf;
+        nodeBuf[i*3]=n.x; nodeBuf[i*3+1]=n.y; nodeBuf[i*3+2]=z;
+      } else { nodeBuf[i*3]=99; nodeBuf[i*3+1]=99; nodeBuf[i*3+2]=0; }
     }
     for (let i=0;i<MAXE;i++){
       if (i<netEdges.length){ const [a,b]=netEdges[i];
-        edgeBuf[i*4]=netNodes[a].x; edgeBuf[i*4+1]=netNodes[a].y;
-        edgeBuf[i*4+2]=netNodes[b].x; edgeBuf[i*4+3]=netNodes[b].y;
+        // an edge vanishes with its node so vacuum pops read cleanly (ring nodes stay lit)
+        if (netNodes[a].vis < 0.3 || netNodes[b].vis < 0.3){
+          edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99;
+        } else {
+          edgeBuf[i*4]=netNodes[a].x; edgeBuf[i*4+1]=netNodes[a].y;
+          edgeBuf[i*4+2]=netNodes[b].x; edgeBuf[i*4+3]=netNodes[b].y;
+        }
       } else { edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99; }
     }
   }
@@ -633,8 +692,8 @@
     vctx.fillText('MAGI SYSTEM // CASPER-3', m+14*s, m+40*s);
     vctx.fillText('EMERGENCY MODE : STANDBY', m+14*s, m+56*s);
 
-    // top-right SYNC ratio
-    const sync = Math.min(0.999, syncSmooth*1.4);
+    // top-right SYNC ratio (living gauge; +tiny readout jitter so it looks live)
+    const sync = Math.min(0.999, syncRatio + (Math.random()-0.5)*0.0015);
     vctx.textAlign = 'right';
     vctx.fillStyle = amber;
     vctx.font = `${Math.round(11*s)}px "Courier New", monospace`;
@@ -802,13 +861,15 @@
     mouse.y = (0.5 - ly);             // uv.y spans ±0.5, screen-top is +y
   }
   view.addEventListener('pointerdown', e => {
-    mouse.down = true; setMouse(e); view.style.cursor = 'grabbing';
+    mouse.down = true; mouse.over = true; setMouse(e); view.style.cursor = 'grabbing';
     try { view.setPointerCapture(e.pointerId); } catch(_){}
   });
-  view.addEventListener('pointermove', e => { if (mouse.down) setMouse(e); });
+  // move always updates position: drag pulls, bare hover repels (see updateNet)
+  view.addEventListener('pointermove', e => { mouse.over = true; setMouse(e); });
   const endDrag = () => { mouse.down = false; view.style.cursor = 'grab'; };
   view.addEventListener('pointerup', endDrag);
-  view.addEventListener('pointercancel', endDrag);
+  view.addEventListener('pointercancel', () => { mouse.down = false; mouse.over = false; });
+  view.addEventListener('pointerleave', () => { mouse.down = false; mouse.over = false; });
 
   ['dragenter','dragover'].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault()));
   document.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if (f&&f.type.startsWith('audio')) loadFile(f); });
@@ -843,8 +904,9 @@
       }
       beat = bt;
       if (P.has('nodes')) setNodeCount(tp('nodes', currentN)|0);
-      // simulate a drag for headless verification: ?mx=..&my=..&md=1
-      mouse.x = tp('mx',0); mouse.y = tp('my',0); mouse.down = tp('md',0) > 0.5;
+      // simulate cursor for headless verification: ?mx=..&my=..&md=1 (drag) or &mh=1 (hover)
+      mouse.x = tp('mx',0); mouse.y = tp('my',0);
+      mouse.down = tp('md',0) > 0.5; mouse.over = mouse.down || tp('mh',0) > 0.5;
       hint.classList.add('hidden');
       let _tframes = 0;
       (function testLoop(){
