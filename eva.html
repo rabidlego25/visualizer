@@ -84,7 +84,6 @@
   }
   input[type=range] { accent-color: var(--amber); cursor: pointer; }
   #seek { flex: 1; height: 5px; }
-  #gainSlider { width: 90px; }
   input[type=file] { display: none; }
   .tlabel { font-size: 12px; color: var(--muted); min-width: 44px; }
   .tlabel:last-child { text-align: right; }
@@ -138,7 +137,6 @@
           <option value="16:9">Wide 16:9</option>
         </select>
       </label>
-      <label class="field">Sync <input type="range" id="gainSlider" min="0.5" max="3" step="0.1" value="1.5"></label>
       <button id="netBtn" class="primary">🧠 Neural</button>
       <label class="field">Nodes <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.7"></label>
       <button id="safeBtn" title="Reduce flashing & motion">🕊 Calm</button>
@@ -173,7 +171,6 @@
   const playBtn   = document.getElementById('playBtn');
   const themeSel  = document.getElementById('themeSel');
   const ratioSel  = document.getElementById('ratioSel');
-  const gainSlider= document.getElementById('gainSlider');
   const recBtn    = document.getElementById('recBtn');
   const recDot    = document.getElementById('recDot');
   const timerEl   = document.getElementById('timer');
@@ -434,7 +431,7 @@
 
     // --- AT-field hex grid ---
     float scale = 6.5 + u_bass*2.5;
-    float ang = t*0.07 + u_bass*0.5 + 0.25*sin(t*0.13);   // livelier, audio-driven drift
+    float ang = t*0.07 + u_bass*0.5 + u_coil*0.6 + 0.25*sin(t*0.13);   // spins up as tension builds
     mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
     vec2 huv = rot * uv * scale;
     vec4 hc = hexCoords(huv);
@@ -444,7 +441,7 @@
     float f = fftAt(cellR*0.045);                      // audio energy for this ring
     float ripple = 0.5 + 0.5*sin(cellR*0.9 - t*3.2);   // expanding pulse
     // low ambient so idle stays dark/clean; edges light up with audio + beats
-    float glow = edge * (0.05 + f*2.4 + u_beat*ripple*2.6*u_safe);
+    float glow = edge * (0.05 + f*2.4 + u_beat*ripple*2.6*u_safe + u_burst*1.2);   // release flashes the field
     vec3 hexCol = mix(u_c2, u_c1, clamp(f*1.6 + u_beat*0.5, 0.0, 1.0));
     hexCol = hueShift(hexCol, sin(cellR*0.30 + t*0.20)*0.16 + f*0.25); // subtle shimmer
     // AT-field recedes as the web coalesces into a silhouette, so the figure reads
@@ -456,17 +453,17 @@
     // -> the field rotates individually, not in unison. Rate rises with the music.
     vec2 gv = huv - hc.zw;                              // local coord within this cell
     float cid = fract(sin(dot(hc.zw, vec2(12.9898,78.233)))*43758.5453);
-    float cang = t*(0.5 + cid*2.2)*(0.5 + u_bass*1.6) + cid*6.2831;  // per-cell spin
+    float cang = t*(0.5 + cid*2.2)*(0.5 + u_bass*1.6 + u_coil*1.8) + cid*6.2831;  // spins up with tension
     float pa = atan(gv.x, gv.y) + cang;                // rotate the glyph
     float pr = length(gv);
     float k = 6.2831/3.0;                              // 3 sides -> triangle
     float poly = cos(floor(0.5 + pa/k)*k - pa) * pr;   // regular-polygon distance (iq)
     float triSz = 0.14 + f*0.05;
     float tri = smoothstep(0.018, 0.0, abs(poly - triSz));
-    col += hexCol * tri * (0.12 + f*1.8 + u_beat*0.4*u_safe) * hexDim;
+    col += hexCol * tri * (0.12 + f*1.8 + u_beat*0.4*u_safe + u_burst*0.7) * hexDim;
 
     // --- central eye / S2 core ---
-    float coreR = 0.10 + u_bass*0.14 + u_beat*0.05;
+    float coreR = 0.10 + u_bass*0.14 + u_beat*0.05 + u_burst*0.06;   // core swells on the release
     float core  = smoothstep(coreR, 0.0, d);
     float iris  = 0.5 + 0.5*sin(d*46.0 - t*2.2);
     vec3 coreCol = mix(u_c1, vec3(1.0,0.92,0.72), core);
@@ -489,7 +486,7 @@
     float t = u_time;
     // beat "punch": zoom + rotation kick on every hit for kinetic impact; the
     // release adds a brief outward pop so the drop lands physically.
-    uv /= (1.0 + (u_beat*0.08 + u_burst*0.05)*u_safe);
+    uv /= (1.0 + (u_beat*0.08 + u_burst*0.05 + u_coil*0.04)*u_safe);   // whole view breathes with the song
     float rk = u_beat*0.03*u_safe;
     uv = mat2(cos(rk),-sin(rk),sin(rk),cos(rk)) * uv;
 
@@ -582,6 +579,8 @@
   // while energy is rising (a build), relaxes on plateaus/quiet, and releases in an
   // outward burst on a drop (a sharp energy jump). Tuned via an offline envelope sim.
   let energyFast = 0, energyMed = 0, energyLag = 0, coil = 0, burst = 0, releaseLock = 0;
+  // reactive gain (auto): keeps brightness consistent across tracks, no user knob
+  let agcEnv = 0.2, inputGain = 1.0;
   // auto-exposure: a slow envelope of overall loudness. Transients spike bright
   // first (adapt hasn't caught up), then brightness settles as it rises.
   let expoAdapt=0;
@@ -594,10 +593,17 @@
   let safe = false;
   function safeVal(){ return safe ? 0.2 : 1.0; }
   function analyze(now){
-    const g = +gainSlider.value;
-    const bass = Math.min(band(1,18)*g, 1.4);
-    const mid  = Math.min(band(40,180)*g, 1.4);
-    const treb = Math.min(band(300,700)*g, 1.4);
+    // reactive gain (AGC): normalize the input so quiet & loud tracks read the same,
+    // with no user control. Replaces the old manual "Sync" slider (which over-drove
+    // the scene into an unreadable white-out).
+    const rawB = band(1,18), rawM = band(40,180), rawT = band(300,700);
+    const rawE = rawB*0.6 + rawM*0.3 + rawT*0.1;
+    agcEnv = agcEnv*0.985 + rawE*0.015;                 // slow loudness estimate (~1.5s)
+    inputGain = Math.max(0.8, Math.min(2.0, 0.42/(agcEnv+0.06)));
+    const g = inputGain;
+    const bass = Math.min(rawB*g, 1.4);
+    const mid  = Math.min(rawM*g, 1.4);
+    const treb = Math.min(rawT*g, 1.4);
     bassSmooth = bassSmooth*0.92 + bass*0.08;
     if (bass > bassSmooth*1.3 && bass > 0.32 && now-lastBeat>170) { beat=1; lastBeat=now; }
     beat *= 0.90;
@@ -732,13 +738,19 @@
       n.phase += dt * n.spd * (1 + n.e*1.5 + beat*2.5);
       // web stays free (no stick-figure snapping); as the figure forms it gently
       // converges inward and the shader fades the web out, leaving the solid figure.
-      const rr = n.r*(1 + n.e*0.9) + beat*0.05;
-      const gather = 1 - coh*0.30;
-      // breathing: coil contracts the whole constellation inward (tension winding
-      // up); burst throws it outward on the release. Scales around center.
-      const breathe = (1 - coil*0.5) * (1 + burst*0.9);
-      let bx = (n.hx*hw + Math.cos(n.phase)*rr) * gather * breathe;   // base (home + drift)
-      let by = (n.hy*hh + Math.sin(n.phase*1.3)*rr) * gather * breathe;
+      // breathing acts on each node's LOCAL drift around its own home -- NOT a global
+      // pull to center -- so the web stays spread across the frame and shows behavior
+      // throughout. coil tightens the drift into a taut, trembling lattice; burst jolts
+      // each node outward from its home (dispersal), then it settles.
+      const rr = (n.r*(1 + n.e*0.9) + beat*0.05) * (1 - coil*0.6) * (1 + burst*2.2);
+      const gather = 1 - coh*0.30;                     // mild inward pull only while a figure forms
+      let bx = n.hx*hw*gather + Math.cos(n.phase)*rr;
+      let by = n.hy*hh*gather + Math.sin(n.phase*1.3)*rr;
+      if (coil > 0.05){                                // wound-up tension trembles in place
+        const tr = coil*0.02;
+        bx += Math.sin(netTime*40 + n.phase*7)*tr;
+        by += Math.cos(netTime*37 + n.phase*5)*tr;
+      }
       // cursor influence: DRAG pulls nodes toward the cursor; a bare HOVER pushes
       // them away (repulsion). Both use a spring + damping so they settle naturally.
       let tx = 0, ty = 0;
@@ -801,7 +813,7 @@
   }
   function applyNet(now){
     const dt = Math.min((now-lastNetT)/1000, 0.05); lastNetT = now;
-    updateNet(dt, +gainSlider.value);
+    updateNet(dt, inputGain);
     gl.uniform3fv(uni.u_nodes, nodeBuf);
     gl.uniform4fv(uni.u_edges, edgeBuf);
     gl.uniform1f(uni.u_net, netOn ? 1 : 0);
@@ -865,7 +877,7 @@
     const startY = H/2 - (bars*(bh+gap))/2;
     for (let i=0;i<bars;i++){
       const idx = Math.floor(Math.pow(i/bars,1.5)*220)+2;
-      const v = Math.min((freqData[idx]/255)* (+gainSlider.value), 1);
+      const v = Math.min((freqData[idx]/255)*inputGain, 1);
       const lit = Math.round(v*14);
       for (let j=0;j<14;j++){
         vctx.globalAlpha = j<lit ? 1 : 0.12;
@@ -953,15 +965,20 @@
   function startLoop(){ if (running) return; running=true; startT=performance.now(); requestAnimationFrame(loop); }
 
   // ---------------- Recording ----------------
-  let recorder=null, chunks=[], recStart=0, recTimer=null;
+  let recorder=null, chunks=[], recStart=0, recTimer=null, recMime='video/webm';
   function startRec(){
     const stream = view.captureStream(60);
     const tracks = [...stream.getVideoTracks()];
     if (destNode && destNode.stream.getAudioTracks().length) tracks.push(...destNode.stream.getAudioTracks());
     const mixed = new MediaStream(tracks);
-    const mime = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
+    // prefer MP4 (opens everywhere / socials / iOS); fall back to WebM where MP4
+    // recording isn't supported (older Chrome/Firefox).
+    const mime = ['video/mp4;codecs=avc1.4d002a,mp4a.40.2','video/mp4;codecs=h264,aac','video/mp4',
+                  'video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm']
+                 .find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
+    recMime = mime;
     try { recorder = new MediaRecorder(mixed, { mimeType:mime, videoBitsPerSecond:14_000_000 }); }
-    catch(e){ recorder = new MediaRecorder(mixed); }
+    catch(e){ recorder = new MediaRecorder(mixed); recMime = recorder.mimeType || 'video/webm'; }
     chunks=[];
     recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
     recorder.onstop = saveRec;
@@ -975,11 +992,12 @@
     recDot.style.display='none'; recBtn.textContent='● Rec'; clearInterval(recTimer);
   }
   function saveRec(){
-    const blob = new Blob(chunks, {type:'video/webm'});
+    const ext = recMime.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(chunks, {type:recMime.split(';')[0]});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
-    a.href=url; a.download=`eva-visualizer-${stamp}.webm`; a.click();
+    a.href=url; a.download=`eva-visualizer-${stamp}.${ext}`; a.click();
     setTimeout(()=>URL.revokeObjectURL(url), 4000);
   }
 
