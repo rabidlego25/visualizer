@@ -419,24 +419,16 @@
     }
     return d*s;
   }
-  // glowing energy construct: gradient interior + holo scanlines + bright rim,
-  // so it reads as light rather than a flat slab. Gated by u_coh.
+  // A THIN, translucent wireframe ghost -- just a whisper of geometry behind the web.
+  // The neural net is the hero; this is a faint hint, never a solid form.
   vec3 figure(vec2 uv, float t){
     if (u_coh < 0.01 || u_figN < 3) return vec3(0.0);
-    float sdf   = figSDF(uv);
-    float fill  = smoothstep(0.004, -0.004, sdf);          // inside mask
-    float depth = smoothstep(-0.30, 0.0, sdf);             // 0 deep-inside -> 1 at edge
-    float edge  = smoothstep(0.020, 0.0, abs(sdf));        // outline band
-    float scan  = 0.5 + 0.5*sin(uv.y*150.0 - t*4.0);       // holo scanlines
-    // interior is a soft gradient (brighter toward the rim) -> the field breathes,
-    // background still reads through it, no blown-out solid slab
-    // kept subtle: a ghostly form layered INSIDE the web, never dominating it --
-    // this is a music visualizer first, the shape is just an accent.
-    vec3 col  = u_figA * fill * (0.06 + depth*0.18) * (0.5 + u_bass*0.5);
-    col += u_figA * fill * scan * 0.05;                     // faint scan texture
-    col += u_figB * edge * (0.55 + u_beat*0.5);             // soft outline
-    col += vec3(1.0,0.97,0.9) * smoothstep(0.004,0.0,abs(sdf)) * 0.28;  // faint core line
-    return col * u_coh * 0.7;
+    float sdf  = figSDF(uv);
+    float line = smoothstep(0.0035, 0.0, abs(sdf));        // hairline outline only
+    float fill = smoothstep(0.0, -0.02, sdf);              // interior mask (soft edge)
+    vec3 col  = u_figB * line * (0.30 + u_beat*0.25);      // faint thin wire
+    col += u_figA * fill * 0.03 * (0.5 + u_bass*0.5);      // barely-there interior tint
+    return col * u_coh * 0.5;
   }
 
   vec3 scene(vec2 uv, float t){
