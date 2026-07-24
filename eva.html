@@ -304,6 +304,11 @@
   uniform float u_exposure;     // auto-exposure: <1 during sustained-loud passages
   uniform float u_safe;         // 1 = full effects, low = reduced motion/flashing
   uniform float u_coh;          // 0..1 coalescence: background quiets so the figure reads
+  const int MAXF = 24;          // silhouette outline points (closed polygon)
+  uniform vec2  u_fig[MAXF];    // figure outline in uv space (already spun/placed by JS)
+  uniform int   u_figN;         // active outline point count (0 = no figure)
+  uniform vec3  u_figA;         // figure body color
+  uniform vec3  u_figB;         // figure rim / accent color
 
   float hexDist(vec2 p){ p = abs(p); return max(dot(p, vec2(0.866025,0.5)), p.y); }
   vec4 hexCoords(vec2 uv){
@@ -388,6 +393,36 @@
     return col;
   }
 
+  // signed distance to the closed figure polygon (negative = inside). Winding
+  // test (iq) gives a solid fillable silhouette regardless of node count.
+  float figSDF(vec2 p){
+    float d = 1e9, s = 1.0;
+    int n = u_figN;
+    for (int i=0;i<MAXF;i++){
+      if (i>=n) break;
+      int j = i==0 ? n-1 : i-1;
+      vec2 a = u_fig[i], b = u_fig[j];
+      d = min(d, segDist(p,a,b));
+      bvec3 c = bvec3(p.y>=a.y, p.y<b.y, (b.x-a.x)*(p.y-a.y) > (b.y-a.y)*(p.x-a.x));
+      if (all(c) || all(not(c))) s = -s;
+    }
+    return d*s;
+  }
+  // solid glowing silhouette: colored fill + inner gradient + hot rim, gated by u_coh
+  vec3 figure(vec2 uv){
+    if (u_coh < 0.01 || u_figN < 3) return vec3(0.0);
+    float sdf  = figSDF(uv);
+    float fill = smoothstep(0.006, -0.006, sdf);          // crisp solid body
+    float inner= smoothstep(-0.02, -0.16, sdf);           // interior depth
+    float rim  = smoothstep(0.020, 0.0, abs(sdf));         // outline band
+    vec3 body  = mix(u_figA, u_figB, 0.30 + 0.30*u_beat);
+    vec3 col   = body * fill * (0.55 + u_bass*0.55);
+    col += body   * inner * 0.30;
+    col += u_figB * rim * (1.1 + u_beat*0.9);
+    col += vec3(1.0,0.97,0.9) * smoothstep(0.005,0.0,abs(sdf)) * 0.7;  // hot core line
+    return col * u_coh;
+  }
+
   vec3 scene(vec2 uv, float t){
     vec3 col = vec3(0.0);
     float d = length(uv);
@@ -412,6 +447,18 @@
     col += hexCol * glow * hexDim;
     // fill a cell only when its band is strong (f squared -> nothing at idle)
     col += hexCol * smoothstep(0.30, 0.46, hc.y) * f*f * 0.5 * hexDim;
+    // each cell carries its own triangle that spins at its OWN rate (per-cell hash)
+    // -> the field rotates individually, not in unison. Rate rises with the music.
+    vec2 gv = huv - hc.zw;                              // local coord within this cell
+    float cid = fract(sin(dot(hc.zw, vec2(12.9898,78.233)))*43758.5453);
+    float cang = t*(0.5 + cid*2.2)*(0.5 + u_bass*1.6) + cid*6.2831;  // per-cell spin
+    float pa = atan(gv.x, gv.y) + cang;                // rotate the glyph
+    float pr = length(gv);
+    float k = 6.2831/3.0;                              // 3 sides -> triangle
+    float poly = cos(floor(0.5 + pa/k)*k - pa) * pr;   // regular-polygon distance (iq)
+    float triSz = 0.14 + f*0.05;
+    float tri = smoothstep(0.018, 0.0, abs(poly - triSz));
+    col += hexCol * tri * (0.12 + f*1.8 + u_beat*0.4*u_safe) * hexDim;
 
     // --- central eye / S2 core ---
     float coreR = 0.10 + u_bass*0.14 + u_beat*0.05;
@@ -457,8 +504,11 @@
     scn += mix(u_c1, vec3(1.0), 0.6) * sl;
     scn *= u_exposure;
     // neural web stays readable: dims far less than the background (0.7 -> ~30% of the dimming)
-    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7) * (1.0 + u_coh*0.7);
-    vec3 col = scn + net;
+    // ...but as the figure coalesces the web RECEDES so the solid silhouette dominates
+    // (fixes the old "sync high = unreadable bright blob").
+    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7) * (1.0 - u_coh*0.85);
+    vec3 fig = figure(uv);
+    vec3 col = scn + net + fig;
 
     // ---- VIVID grade (Testify / anime pop) ----
     col += col*col*0.42;                                    // gentler HDR bloom lift
@@ -498,7 +548,7 @@
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     // uniforms
-    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net','u_exposure','u_safe','u_coh'])
+    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net','u_exposure','u_safe','u_coh','u_fig','u_figN','u_figA','u_figB'])
       uni[n] = gl.getUniformLocation(prog, n);
     // fft texture
     const bins = analyser ? analyser.frequencyBinCount : 1024;
@@ -551,9 +601,12 @@
   }
 
   // ---------------- Neural web (geometry fed to the GPU each frame) ----------------
-  const MAXN = 48, MAXE = 96;
+  const MAXN = 48, MAXE = 96, MAXF = 24;
   const nodeBuf = new Float32Array(MAXN*3);   // x, y, energy
   const edgeBuf = new Float32Array(MAXE*4);   // x1,y1,x2,y2
+  const figBuf  = new Float32Array(MAXF*2);   // silhouette outline points (uv space)
+  let figN = 0;                               // active outline points this frame
+  const figA = new Float32Array(3), figB = new Float32Array(3);  // body / rim color
   let currentN = 0;                            // active node count (scalable)
   let netNodes = [], netEdges = [], netOn = true, lastNetT = performance.now();
   // pointer/drag influence on the neural web (uv-space cursor position)
@@ -604,27 +657,27 @@
   function setNodeCount(N){ if (N !== currentN) initNet(N); }
 
   // ---- Evangelion coalescence ----------------------------------------------
-  // On hard passages the nodes gather into a silhouette and morph to the next on
-  // the next big beat. Each shape is an ORDERED polyline in logical [-1,1] space
-  // (same frame as node home coords); connecting consecutive nodes traces it.
-  // `loop` closes the last point back to the first.
-  // `spin` = base angular velocity (rad/s) scaled by the audio: geometric Angels
-  // tumble freely; humanoid forms (spin 0) rock gently instead of flipping over.
+  // Each shape is a CLOSED, non-self-intersecting outline in logical [-1,1] space,
+  // rendered as a solid filled silhouette by the shader's polygon SDF (see figure()).
+  // Original stylized forms (geometry + a generic humanoid), each with its own color.
+  // `spin` = base angular velocity (rad/s), scaled by audio: geometric forms tumble
+  // freely; humanoid form (spin 0) rocks gently instead of flipping upside-down.
   const SHAPES = [
-    { name:'RAMIEL', loop:true, spin:0.9, pts:[  // Angel: octahedron / diamond
+    { name:'RAMIEL', spin:0.9, a:[0.12,0.30,0.98], b:[0.55,0.92,1.0], pts:[   // blue octahedron
       [0,1],[0.5,0.5],[0.92,0.08],[0.92,-0.08],[0.5,-0.5],
       [0,-1],[-0.5,-0.5],[-0.92,-0.08],[-0.92,0.08],[-0.5,0.5] ] },
-    { name:'EVA-01', loop:true, spin:0, pts:[    // horned Eva mask
-      [0,1.12],[0.14,0.55],[0.5,0.5],[0.66,0.05],[0.42,-0.5],
-      [0,-0.9],[-0.42,-0.5],[-0.66,0.05],[-0.5,0.5],[-0.14,0.55] ] },
-    { name:'PILOT', loop:false, spin:0, pts:[    // humanoid figure (arms + legs)
-      [0,1.0],[0,0.68],[-0.45,0.55],[-0.72,0.1],[-0.45,0.55],[0,0.66],
-      [0.45,0.55],[0.72,0.1],[0.45,0.55],[0,0.66],[0,-0.05],
-      [-0.3,-0.55],[-0.34,-1.05],[-0.3,-0.55],[0,-0.05],[0.3,-0.55],[0.34,-1.05] ] },
-    { name:'CROSS', loop:false, spin:0.5, pts:[  // Angel-death cruciform
-      [0,1],[0,0.5],[0,0],[0,-0.5],[0,-1],[0,-0.5],[0,0],
-      [-0.45,0],[-0.9,0],[-0.45,0],[0,0],[0.45,0],[0.9,0] ] },
-    { name:'AT-FIELD', loop:true, spin:1.1, pts:[ // hexagon
+    { name:'SENTINEL', spin:0, a:[0.42,0.13,0.64], b:[0.28,1.0,0.5], pts:[    // purple/green mask
+      [0,1.12],[0.16,0.55],[0.5,0.5],[0.66,0.05],[0.42,-0.5],
+      [0,-0.9],[-0.42,-0.5],[-0.66,0.05],[-0.5,0.5],[-0.16,0.55] ] },
+    { name:'PILOT', spin:0, a:[0.88,0.22,0.20], b:[1.0,0.72,0.32], pts:[      // humanoid silhouette
+      [0,1.05],[0.17,0.9],[0.17,0.68],[0.48,0.58],[0.5,0.5],[0.32,0.15],[0.46,-0.5],
+      [0.24,-0.52],[0.28,-1.05],[0.06,-1.05],[0.06,-0.5],[-0.06,-0.5],[-0.06,-1.05],
+      [-0.28,-1.05],[-0.24,-0.52],[-0.46,-0.5],[-0.32,0.15],[-0.5,0.5],[-0.48,0.58],
+      [-0.17,0.68],[-0.17,0.9] ] },
+    { name:'CROSS', spin:0.5, a:[1.0,0.82,0.45], b:[1.0,1.0,0.92], pts:[      // cruciform
+      [-0.16,1],[0.16,1],[0.16,0.16],[0.9,0.16],[0.9,-0.16],[0.16,-0.16],
+      [0.16,-1],[-0.16,-1],[-0.16,-0.16],[-0.9,-0.16],[-0.9,0.16],[-0.16,0.16] ] },
+    { name:'AT-FIELD', spin:1.1, a:[1.0,0.5,0.08], b:[1.0,0.82,0.35], pts:[   // hexagon
       [0,1],[0.87,0.5],[0.87,-0.5],[0,-1],[-0.87,-0.5],[-0.87,0.5] ] },
   ];
   let coh = 0, shapeIdx = 0, shapeDwell = 0;
@@ -640,7 +693,6 @@
     // coalescence: emerges only when the track drives (sync high); beats snap it
     // tighter and, past a dwell, morph to the next character.
     const shp = SHAPES[shapeIdx];
-    const fc  = Math.min(netNodes.length, shp.pts.length);   // nodes that trace the figure
     const cohTar = Math.max(0, Math.min(1, (syncRatio - 0.72) / 0.2));
     coh += (cohTar - coh) * (cohTar > coh ? 0.06 : 0.03);    // ease in faster than out
     if (beat > 0.6) coh = Math.min(1, coh + 0.12);
@@ -660,17 +712,12 @@
       const n = netNodes[i];
       n.e = freqData ? Math.min((freqData[n.band]/255)*gain*syncGain, 1.3) : 0;
       n.phase += dt * n.spd * (1 + n.e*1.5 + beat*2.5);
-      const inFig = forming && i < fc;
-      const rr = (n.r*(1 + n.e*0.9) + beat*0.05) * (inFig ? 1 - coh*0.85 : 1);
-      let bx = n.hx*hw + Math.cos(n.phase)*rr;         // base (home + drift)
-      let by = n.hy*hh + Math.sin(n.phase*1.3)*rr;
-      if (inFig){                                       // pull toward this shape's point
-        const px = shp.pts[i][0]*hw, py = shp.pts[i][1]*hh;
-        const sx = px*fcs - py*fsn, sy = px*fsn + py*fcs;   // spin the silhouette
-        bx = bx*(1-coh) + sx*coh;
-        by = by*(1-coh) + sy*coh;
-        n.e = Math.max(n.e, coh*0.55);                  // keep the silhouette lit
-      }
+      // web stays free (no stick-figure snapping); as the figure forms it gently
+      // converges inward and the shader fades the web out, leaving the solid figure.
+      const rr = n.r*(1 + n.e*0.9) + beat*0.05;
+      const gather = 1 - coh*0.30;
+      let bx = (n.hx*hw + Math.cos(n.phase)*rr) * gather;   // base (home + drift)
+      let by = (n.hy*hh + Math.sin(n.phase*1.3)*rr) * gather;
       // cursor influence: DRAG pulls nodes toward the cursor; a bare HOVER pushes
       // them away (repulsion). Both use a spring + damping so they settle naturally.
       let tx = 0, ty = 0;
@@ -686,11 +733,9 @@
       n.ox += n.ovx; n.oy += n.ovy;
       n.x = bx + n.ox;
       n.y = by + n.oy;
-      // life: figure nodes snap fully visible; free inner nodes keep the
-      // quantum-vacuum flicker (a spark on each wink), popping faster on their band.
-      if (inFig){
-        n.vis += (1 - n.vis) * Math.min(1, dt*16); n.flash *= 0.85;
-      } else if (!n.ring){
+      // life: inner nodes keep the quantum-vacuum flicker (a spark on each wink),
+      // popping faster on their band; ring nodes stay lit.
+      if (!n.ring){
         n.tflip -= dt * (0.5 + n.e*2.2 + beat*2.5) * cf;
         if (n.tflip <= 0){
           n.vtar = n.vtar > 0.5 ? 0 : 1;                // toggle presence
@@ -708,27 +753,28 @@
         nodeBuf[i*3]=n.x; nodeBuf[i*3+1]=n.y; nodeBuf[i*3+2]=z;
       } else { nodeBuf[i*3]=99; nodeBuf[i*3+1]=99; nodeBuf[i*3+2]=0; }
     }
-    if (forming && coh > 0.5){
-      // trace the silhouette: connect consecutive figure nodes (loop shapes close)
-      let ei = 0;
-      const put = (a,b)=>{ edgeBuf[ei*4]=netNodes[a].x; edgeBuf[ei*4+1]=netNodes[a].y;
-                           edgeBuf[ei*4+2]=netNodes[b].x; edgeBuf[ei*4+3]=netNodes[b].y; ei++; };
-      for (let k=0;k<fc-1 && ei<MAXE;k++) put(k, k+1);
-      if (shp.loop && fc>2 && ei<MAXE) put(fc-1, 0);
-      for (; ei<MAXE; ei++){ edgeBuf[ei*4]=edgeBuf[ei*4+1]=edgeBuf[ei*4+2]=edgeBuf[ei*4+3]=99; }
-    } else {
-      for (let i=0;i<MAXE;i++){
-        if (i<netEdges.length){ const [a,b]=netEdges[i];
-          // an edge vanishes with its node so vacuum pops read cleanly (ring nodes stay lit)
-          if (netNodes[a].vis < 0.3 || netNodes[b].vis < 0.3){
-            edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99;
-          } else {
-            edgeBuf[i*4]=netNodes[a].x; edgeBuf[i*4+1]=netNodes[a].y;
-            edgeBuf[i*4+2]=netNodes[b].x; edgeBuf[i*4+3]=netNodes[b].y;
-          }
-        } else { edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99; }
-      }
+    // web edges (the figure is drawn by the shader's filled SDF, not by these)
+    for (let i=0;i<MAXE;i++){
+      if (i<netEdges.length){ const [a,b]=netEdges[i];
+        // an edge vanishes with its node so vacuum pops read cleanly (ring nodes stay lit)
+        if (netNodes[a].vis < 0.3 || netNodes[b].vis < 0.3){
+          edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99;
+        } else {
+          edgeBuf[i*4]=netNodes[a].x; edgeBuf[i*4+1]=netNodes[a].y;
+          edgeBuf[i*4+2]=netNodes[b].x; edgeBuf[i*4+3]=netNodes[b].y;
+        }
+      } else { edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99; }
     }
+    // build the solid figure outline: spin each point, scale to uv, upload as u_fig
+    const pts = shp.pts, fn = Math.min(pts.length, MAXF);
+    for (let i=0;i<fn;i++){
+      const px = pts[i][0]*hw, py = pts[i][1]*hh;
+      figBuf[i*2]   = px*fcs - py*fsn;
+      figBuf[i*2+1] = px*fsn + py*fcs;
+    }
+    figN = (netOn && coh > 0.01) ? fn : 0;
+    figA[0]=shp.a[0]; figA[1]=shp.a[1]; figA[2]=shp.a[2];
+    figB[0]=shp.b[0]; figB[1]=shp.b[1]; figB[2]=shp.b[2];
   }
   function applyNet(now){
     const dt = Math.min((now-lastNetT)/1000, 0.05); lastNetT = now;
@@ -737,6 +783,10 @@
     gl.uniform4fv(uni.u_edges, edgeBuf);
     gl.uniform1f(uni.u_net, netOn ? 1 : 0);
     gl.uniform1f(uni.u_coh, netOn ? coh : 0);
+    gl.uniform2fv(uni.u_fig, figBuf);
+    gl.uniform1i(uni.u_figN, figN);
+    gl.uniform3fv(uni.u_figA, figA);
+    gl.uniform3fv(uni.u_figB, figB);
   }
 
   // ---------------- NERV HUD (2D overlay) ----------------
@@ -1006,6 +1056,8 @@
         gl.uniform3fv(uni.u_nodes, nodeBuf); gl.uniform4fv(uni.u_edges, edgeBuf);
         gl.uniform1f(uni.u_net, netOn?1:0);
         gl.uniform1f(uni.u_coh, netOn ? coh : 0);
+        gl.uniform2fv(uni.u_fig, figBuf); gl.uniform1i(uni.u_figN, figN);
+        gl.uniform3fv(uni.u_figA, figA); gl.uniform3fv(uni.u_figB, figB);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         vctx.drawImage(glCanvas, 0, 0, W, H);
         drawHUD({bass,mid,treb,energy}, tf*1000);
