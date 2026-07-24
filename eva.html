@@ -192,7 +192,7 @@
   ];
 
   // ---------------- Audio ----------------
-  let audioCtx=null, analyser=null, sourceNode=null, mediaEl=null, micStream=null;
+  let audioCtx=null, analyser=null, sourceNode=null, mediaEl=null, mediaElSrc=null, micStream=null;
   let freqData=null, timeData=null, destNode=null, currentURL=null;
 
   function ensureAudio() {
@@ -230,10 +230,13 @@
         seek.value = (mediaEl.currentTime/mediaEl.duration)*1000;
         curTime.textContent = fmt(mediaEl.currentTime);
       });
+      // an <audio> element may only ever have ONE MediaElementSource -- create it
+      // once and reuse it, or a second load throws InvalidStateError (drop #2 fails).
+      mediaElSrc = audioCtx.createMediaElementSource(mediaEl);
     }
     mediaEl.src = currentURL; mediaEl.loop=false;
     mediaEl.onended = () => { playBtn.textContent='▶ Play'; };
-    sourceNode = audioCtx.createMediaElementSource(mediaEl);
+    sourceNode = mediaElSrc;
     connect(sourceNode, true);
     playBtn.disabled=false; recBtn.disabled=false;
     hint.classList.add('hidden'); startLoop(); play();
@@ -1044,8 +1047,16 @@
   view.addEventListener('pointercancel', () => { mouse.down = false; mouse.over = false; });
   view.addEventListener('pointerleave', () => { mouse.down = false; mouse.over = false; });
 
+  // accept by MIME *or* extension: files dragged from many sources arrive with an
+  // empty type, so a MIME-only check silently rejects perfectly good mp3s.
+  const isAudioFile = f => f && (/^audio\//.test(f.type) || /\.(mp3|wav|ogg|oga|m4a|aac|flac|opus|weba|webm|aiff?|3gp)$/i.test(f.name||''));
   ['dragenter','dragover'].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault()));
-  document.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if (f&&f.type.startsWith('audio')) loadFile(f); });
+  document.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (isAudioFile(f)) loadFile(f);
+    else if (f) alert('Please drop an audio file (mp3, wav, m4a, ogg, flac…).');
+  });
   window.addEventListener('resize', resize);
 
   // ---------------- Boot ----------------
