@@ -126,6 +126,7 @@
           <option value="1">02 · Unit-01</option>
           <option value="2">03 · Pattern Blue</option>
           <option value="3">04 · Blood</option>
+          <option value="4">05 · Testify ✦</option>
         </select>
       </label>
       <label class="field">Format
@@ -137,6 +138,7 @@
       </label>
       <label class="field">Sync <input type="range" id="gainSlider" min="0.5" max="3" step="0.1" value="1.5"></label>
       <button id="netBtn" class="primary">🧠 Neural</button>
+      <button id="safeBtn" title="Reduce flashing & motion">🕊 Calm</button>
     </div>
     <div class="sep"></div>
     <div class="group">
@@ -173,6 +175,7 @@
   const recDot    = document.getElementById('recDot');
   const timerEl   = document.getElementById('timer');
   const netBtn    = document.getElementById('netBtn');
+  const safeBtn   = document.getElementById('safeBtn');
   const seekbar   = document.getElementById('seekbar');
   const seek      = document.getElementById('seek');
   const curTime   = document.getElementById('curTime');
@@ -184,6 +187,7 @@
     { c1:[0.55,1.0,0.18], c2:[0.55,0.12,0.95], hud:'#8cff3c' }, // Unit-01 green/purple
     { c1:[0.35,0.75,1.0], c2:[0.10,0.25,0.95], hud:'#4cc9ff' }, // Pattern Blue
     { c1:[1.0,0.25,0.15], c2:[0.55,0.02,0.02], hud:'#ff4530' }, // Blood
+    { c1:[1.0,0.82,0.20], c2:[1.0,0.12,0.70], hud:'#ffcf3a' }, // Testify (gold + magenta, hyper-vivid)
   ];
 
   // ---------------- Audio ----------------
@@ -293,6 +297,8 @@
   uniform vec3  u_nodes[MAXN];  // xy = position (uv space), z = energy 0..1
   uniform vec4  u_edges[MAXE];  // (x1,y1) -> (x2,y2); padded entries use x>90
   uniform float u_net;          // neural-net master intensity 0..1
+  uniform float u_exposure;     // auto-exposure: <1 during sustained-loud passages
+  uniform float u_safe;         // 1 = full effects, low = reduced motion/flashing
 
   float hexDist(vec2 p){ p = abs(p); return max(dot(p, vec2(0.866025,0.5)), p.y); }
   vec4 hexCoords(vec2 uv){
@@ -306,6 +312,21 @@
     return vec4(gv.x, y, id);
   }
   float fftAt(float t){ return texture(u_fft, vec2(clamp(t,0.0,1.0), 0.5)).r; }
+
+  // rotate a color around the value axis -> vivid hue shimmer
+  vec3 hueShift(vec3 c, float a){
+    const vec3 k = vec3(0.57735);
+    float cs = cos(a), sn = sin(a);
+    return c*cs + cross(k,c)*sn + k*dot(k,c)*(1.0-cs);
+  }
+  // anime "speed lines" radiating from center, strongest at the edges
+  float speedLines(vec2 uv, float t){
+    float a = atan(uv.y, uv.x);
+    float r = length(uv);
+    float l = sin(a*64.0 + sin(a*11.0 + t)*2.0);
+    l = smoothstep(0.55, 1.0, l);
+    return l * smoothstep(0.30, 1.15, r);
+  }
 
   // distance from point p to segment a-b
   float segDist(vec2 p, vec2 a, vec2 b){
@@ -326,7 +347,7 @@
       // fast-moving data packets (multiple per edge, speed surges on beats)
       float seed = fract(sin(float(i)*13.19)*43758.5453);
       for (int k=0;k<2;k++){
-        float sp  = 0.7 + seed*1.1 + u_beat*1.8;
+        float sp  = 0.7 + seed*1.1 + u_beat*1.8*u_safe;
         float pos = fract(t*sp + seed + float(k)*0.5);
         float pd  = length(uv - mix(e.xy, e.zw, pos));
         col += vec3(1.0,0.96,0.86) * smoothstep(0.013,0.0,pd) * (0.85 + u_beat);
@@ -352,15 +373,18 @@
     mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
     vec2 huv = rot * uv * scale;
     vec4 hc = hexCoords(huv);
-    float line = 1.0 - smoothstep(0.0, 0.06, hc.y);   // bright at cell edges
+    // thin, crisp cell edge (hc.y is ~0 at edges, ~0.5 at centers)
+    float edge = smoothstep(0.035, 0.0, hc.y);
     float cellR = length(hc.zw);                       // ring index from center
     float f = fftAt(cellR*0.045);                      // audio energy for this ring
     float ripple = 0.5 + 0.5*sin(cellR*0.9 - t*3.2);   // expanding pulse
-    float glow = line * (0.10 + f*1.4 + u_beat*ripple*1.8);
+    // low ambient so idle stays dark/clean; edges light up with audio + beats
+    float glow = edge * (0.05 + f*2.4 + u_beat*ripple*2.6*u_safe);
     vec3 hexCol = mix(u_c2, u_c1, clamp(f*1.6 + u_beat*0.5, 0.0, 1.0));
+    hexCol = hueShift(hexCol, sin(cellR*0.30 + t*0.20)*0.16 + f*0.25); // subtle shimmer
     col += hexCol * glow;
-    // faint filled cells that flash on strong bands
-    col += hexCol * smoothstep(0.35,0.5,hc.y) * f * 0.25;
+    // fill a cell only when its band is strong (f squared -> nothing at idle)
+    col += hexCol * smoothstep(0.30, 0.46, hc.y) * f*f * 0.5;
 
     // --- central eye / S2 core ---
     float coreR = 0.10 + u_bass*0.14 + u_beat*0.05;
@@ -373,9 +397,10 @@
     float ring = smoothstep(0.006, 0.0, abs(d - (coreR*2.2)));
     col += u_c1 * ring * (0.4 + u_treble);
 
-    // --- cruciform light burst on beat ---
-    float cross = exp(-abs(uv.x)*20.0) + exp(-abs(uv.y)*20.0);
-    col += vec3(1.0,0.88,0.72) * cross * u_beat * 1.3;
+    // --- cruciform light burst on beat (bigger, brighter) ---
+    float cross = exp(-abs(uv.x)*16.0) + exp(-abs(uv.y)*16.0);
+    cross += 0.5*(exp(-abs(uv.x)*5.0) + exp(-abs(uv.y)*5.0)); // wide bloom arms
+    col += mix(u_c1, vec3(1.0,0.95,0.85), 0.6) * cross * u_beat * (0.7 + 1.4*u_safe);
 
     return col;
   }
@@ -383,21 +408,38 @@
   void main(){
     vec2 uv = (gl_FragCoord.xy - 0.5*u_res) / u_res.y;
     float t = u_time;
-    // chromatic aberration (stronger on beats)
-    float ca = 0.003 + u_beat*0.012;
+    // beat "punch": zoom + rotation kick on every hit for kinetic impact
+    uv /= (1.0 + u_beat*0.08*u_safe);
+    float rk = u_beat*0.03*u_safe;
+    uv = mat2(cos(rk),-sin(rk),sin(rk),cos(rk)) * uv;
+
+    // chromatic aberration (base always on; beat surge gated by safe mode)
+    float ca = 0.004 + u_beat*0.018*u_safe;
     vec2 dir = normalize(uv + 1e-5);
-    vec3 col;
-    col.r = scene(uv + dir*ca, t).r;
-    col.g = scene(uv,          t).g;
-    col.b = scene(uv - dir*ca, t).b;
-    // neural web on top (computed once, not per CA channel)
-    col += neuralNet(uv, t) * u_net;
+    // busy background scene -> compensated by auto-exposure so loud passages settle
+    vec3 scn;
+    scn.r = scene(uv + dir*ca, t).r;
+    scn.g = scene(uv,          t).g;
+    scn.b = scene(uv - dir*ca, t).b;
+    float sl = speedLines(uv, t) * (u_beat*1.4 + u_treble*0.4) * u_safe;
+    scn += mix(u_c1, vec3(1.0), 0.6) * sl;
+    scn *= u_exposure;
+    // neural web stays readable: dims far less than the background (0.7 -> ~30% of the dimming)
+    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7);
+    vec3 col = scn + net;
+
+    // ---- VIVID grade (Testify / anime pop) ----
+    col += col*col*0.42;                                    // gentler HDR bloom lift
+    float l = dot(col, vec3(0.299,0.587,0.114));
+    col = mix(vec3(l), col, 1.5);                           // saturation punch
+    col = hueShift(col, sin(t*0.08)*0.10);                  // slow spectral shimmer
+
     // CRT scanlines + flicker
-    col *= 0.82 + 0.18*sin(gl_FragCoord.y*2.2);
-    col *= 0.95 + 0.05*sin(t*48.0);
-    // vignette
-    col *= smoothstep(1.45, 0.35, length(uv));
-    col = pow(max(col, 0.0), vec3(0.86));
+    col *= 0.86 + 0.14*sin(gl_FragCoord.y*2.2);
+    col *= 0.96 + 0.04*sin(t*48.0)*u_safe;                  // flicker (off in calm mode)
+    col *= smoothstep(1.5, 0.3, length(uv));                // vignette
+    col += vec3(1.0) * u_beat * 0.10 * u_safe;              // transient beat pop (gated)
+    col = pow(max(col, 0.0), vec3(0.80));                   // punchier contrast
     fragColor = vec4(col, 1.0);
   }`;
 
@@ -424,7 +466,7 @@
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     // uniforms
-    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net'])
+    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net','u_exposure','u_safe'])
       uni[n] = gl.getUniformLocation(prog, n);
     // fft texture
     const bins = analyser ? analyser.frequencyBinCount : 1024;
@@ -442,6 +484,17 @@
   // ---------------- Analysis helpers ----------------
   function band(lo,hi){ let s=0,n=0; for(let i=lo;i<hi&&i<freqData.length;i++){s+=freqData[i];n++;} return n? (s/n)/255 : 0; }
   let bassSmooth=0, beat=0, lastBeat=0, syncSmooth=0;
+  // auto-exposure: a slow envelope of overall loudness. Transients spike bright
+  // first (adapt hasn't caught up), then brightness settles as it rises.
+  let expoAdapt=0;
+  function exposure(energy){
+    const rate = energy > expoAdapt ? 0.035 : 0.012;   // rise ~0.5s, fall slower
+    expoAdapt += (energy - expoAdapt) * rate;
+    return Math.max(0.5, 1.0 / (1.0 + expoAdapt*1.25)); // sustained-loud -> down to ~0.5
+  }
+  // calm mode: dampens flashing/strobe/punch (feeds u_safe). Default honors the OS setting.
+  let safe = false;
+  function safeVal(){ return safe ? 0.2 : 1.0; }
   function analyze(now){
     const g = +gainSlider.value;
     const bass = Math.min(band(1,18)*g, 1.4);
@@ -645,6 +698,8 @@
     gl.uniform1f(uni.u_beat, beat);
     gl.uniform3fv(uni.u_c1, th.c1);
     gl.uniform3fv(uni.u_c2, th.c2);
+    gl.uniform1f(uni.u_exposure, exposure(a.energy));
+    gl.uniform1f(uni.u_safe, safeVal());
     applyNet(now);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -696,6 +751,11 @@
     netBtn.classList.toggle('primary', netOn);
     netBtn.textContent = netOn ? '🧠 Neural' : '🧠 Neural: Off';
   });
+  function reflectSafe(){ safeBtn.classList.toggle('primary', safe); safeBtn.textContent = safe ? '🕊 Calm: On' : '🕊 Calm'; }
+  safeBtn.addEventListener('click', () => { safe = !safe; reflectSafe(); });
+  // sync button to the OS-default calm state applied at boot
+  try { if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) safe = true; } catch(e){}
+  reflectSafe();
 
   let seeking=false;
   seek.addEventListener('input', () => { seeking=true; if (mediaEl&&mediaEl.duration) curTime.textContent=fmt((seek.value/1000)*mediaEl.duration); });
@@ -712,6 +772,54 @@
     ensureAudio();          // needed so fft texture width is known
     resize();
     createRenderer();
+
+    // default calm mode to the OS "reduce motion" setting
+    try { safe = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch(e){}
+
+    // ---- evaluation harness hook ----
+    // Renders a DETERMINISTIC frame from URL params (no audio needed) so the
+    // assistant can screenshot specific states headlessly and measure them.
+    // e.g. eva.html?test=1&bass=0.9&beat=1&theme=4&t=2  or &safe=1
+    const P = new URLSearchParams(location.search);
+    if (P.has('test')) {
+      const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
+      const th = THEMES[Math.max(0, Math.min(THEMES.length-1, tp('theme',0)|0))];
+      themeSel.value = String(THEMES.indexOf(th));
+      safe  = tp('safe',0) > 0.5;
+      netOn = tp('net',1) > 0.5;
+      const bass=tp('bass',0.1), mid=tp('mid',0.1), treb=tp('treb',0.1), bt=tp('beat',0), tf=tp('t',2.0);
+      const energy = bass*0.6 + mid*0.3 + treb*0.1;
+      const ex = P.has('expo') ? tp('expo',1) : Math.max(0.5, 1.0/(1.0+energy*1.25));
+      for (let i=0;i<freqData.length;i++){
+        let v = i<40 ? bass*255*(1.0-i/80) : (i<220 ? mid*255 : treb*255);
+        freqData[i] = Math.max(0, Math.min(255, v|0));
+      }
+      beat = bt;
+      hint.classList.add('hidden');
+      let _tframes = 0;
+      (function testLoop(){
+        gl.uniform2f(uni.u_res, W, H);
+        gl.uniform1f(uni.u_time, tf);
+        gl.uniform1f(uni.u_bass, bass); gl.uniform1f(uni.u_mid, mid); gl.uniform1f(uni.u_treble, treb);
+        gl.uniform1f(uni.u_beat, bt);
+        gl.uniform1f(uni.u_exposure, ex);
+        gl.uniform1f(uni.u_safe, safe?0.2:1.0);
+        gl.uniform3fv(uni.u_c1, th.c1); gl.uniform3fv(uni.u_c2, th.c2);
+        gl.bindTexture(gl.TEXTURE_2D, fftTex);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
+        updateNet(0, 1.0);
+        gl.uniform3fv(uni.u_nodes, nodeBuf); gl.uniform4fv(uni.u_edges, edgeBuf);
+        gl.uniform1f(uni.u_net, netOn?1:0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        vctx.drawImage(glCanvas, 0, 0, W, H);
+        drawHUD({bass,mid,treb,energy}, tf*1000);
+        // render a few static frames then STOP so headless virtual-time can idle
+        // (the frame is deterministic, so this settles immediately) and screenshot.
+        if (++_tframes < 6) requestAnimationFrame(testLoop);
+      })();
+      return; // skip the normal idle preview
+    }
+
     // idle preview so it isn't blank before audio loads
     (function idle(now){
       if (!running) {
@@ -721,6 +829,8 @@
         gl.uniform1f(uni.u_bass, 0.12+0.05*Math.sin(now/700));
         gl.uniform1f(uni.u_mid, 0.1); gl.uniform1f(uni.u_treble, 0.1);
         gl.uniform1f(uni.u_beat, 0.0);
+        gl.uniform1f(uni.u_exposure, 1.0);
+        gl.uniform1f(uni.u_safe, safeVal());
         const th = THEMES[+themeSel.value];
         gl.uniform3fv(uni.u_c1, th.c1); gl.uniform3fv(uni.u_c2, th.c2);
         applyNet(now);
