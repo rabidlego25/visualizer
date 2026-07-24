@@ -394,7 +394,7 @@
 
     // --- AT-field hex grid ---
     float scale = 6.5 + u_bass*2.5;
-    float ang = t*0.025;
+    float ang = t*0.07 + u_bass*0.5 + 0.25*sin(t*0.13);   // livelier, audio-driven drift
     mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
     vec2 huv = rot * uv * scale;
     vec4 hc = hexCoords(huv);
@@ -444,10 +444,15 @@
     float ca = 0.004 + u_beat*0.018*u_safe;
     vec2 dir = normalize(uv + 1e-5);
     // busy background scene -> compensated by auto-exposure so loud passages settle
+    // slow continuous drift so the background is always gently rotating; the
+    // neural web stays in screen space (its figures spin under their own control).
+    float gr = t*0.035 + u_bass*0.15;
+    mat2 grot = mat2(cos(gr),-sin(gr),sin(gr),cos(gr));
+    vec2 buv = grot * uv;
     vec3 scn;
-    scn.r = scene(uv + dir*ca, t).r;
-    scn.g = scene(uv,          t).g;
-    scn.b = scene(uv - dir*ca, t).b;
+    scn.r = scene(buv + dir*ca, t).r;
+    scn.g = scene(buv,          t).g;
+    scn.b = scene(buv - dir*ca, t).b;
     float sl = speedLines(uv, t) * (u_beat*1.4 + u_treble*0.4) * u_safe;
     scn += mix(u_c1, vec3(1.0), 0.6) * sl;
     scn *= u_exposure;
@@ -603,24 +608,27 @@
   // the next big beat. Each shape is an ORDERED polyline in logical [-1,1] space
   // (same frame as node home coords); connecting consecutive nodes traces it.
   // `loop` closes the last point back to the first.
+  // `spin` = base angular velocity (rad/s) scaled by the audio: geometric Angels
+  // tumble freely; humanoid forms (spin 0) rock gently instead of flipping over.
   const SHAPES = [
-    { name:'RAMIEL', loop:true, pts:[            // Angel: octahedron / diamond
+    { name:'RAMIEL', loop:true, spin:0.9, pts:[  // Angel: octahedron / diamond
       [0,1],[0.5,0.5],[0.92,0.08],[0.92,-0.08],[0.5,-0.5],
       [0,-1],[-0.5,-0.5],[-0.92,-0.08],[-0.92,0.08],[-0.5,0.5] ] },
-    { name:'EVA-01', loop:true, pts:[            // horned Eva mask
+    { name:'EVA-01', loop:true, spin:0, pts:[    // horned Eva mask
       [0,1.12],[0.14,0.55],[0.5,0.5],[0.66,0.05],[0.42,-0.5],
       [0,-0.9],[-0.42,-0.5],[-0.66,0.05],[-0.5,0.5],[-0.14,0.55] ] },
-    { name:'PILOT', loop:false, pts:[            // humanoid figure (arms + legs)
+    { name:'PILOT', loop:false, spin:0, pts:[    // humanoid figure (arms + legs)
       [0,1.0],[0,0.68],[-0.45,0.55],[-0.72,0.1],[-0.45,0.55],[0,0.66],
       [0.45,0.55],[0.72,0.1],[0.45,0.55],[0,0.66],[0,-0.05],
       [-0.3,-0.55],[-0.34,-1.05],[-0.3,-0.55],[0,-0.05],[0.3,-0.55],[0.34,-1.05] ] },
-    { name:'CROSS', loop:false, pts:[            // Angel-death cruciform
+    { name:'CROSS', loop:false, spin:0.5, pts:[  // Angel-death cruciform
       [0,1],[0,0.5],[0,0],[0,-0.5],[0,-1],[0,-0.5],[0,0],
       [-0.45,0],[-0.9,0],[-0.45,0],[0,0],[0.45,0],[0.9,0] ] },
-    { name:'AT-FIELD', loop:true, pts:[          // hexagon
+    { name:'AT-FIELD', loop:true, spin:1.1, pts:[ // hexagon
       [0,1],[0.87,0.5],[0.87,-0.5],[0,-1],[-0.87,-0.5],[-0.87,0.5] ] },
   ];
   let coh = 0, shapeIdx = 0, shapeDwell = 0;
+  let shapeSpin = 0, netTime = 0;   // accumulating figure rotation + local clock
   let testCoh = null;   // harness override so silhouettes can be screenshotted
 
   function updateNet(dt, gain){
@@ -642,6 +650,12 @@
     }
     if (testCoh != null) coh = testCoh;
     const forming = coh > 0.04;
+    // figure rotation: geometric Angels tumble (rate rises with bass + beat);
+    // humanoid forms (spin 0) rock gently so they never flip upside-down.
+    netTime += dt;
+    shapeSpin += dt * (shp.spin||0) * (0.35 + bassSmooth*1.4 + beat*0.8);
+    const figAng = (shp.spin||0) ? shapeSpin : Math.sin(netTime*1.2)*0.16*coh;
+    const fcs = Math.cos(figAng), fsn = Math.sin(figAng);
     for (let i=0;i<netNodes.length;i++){
       const n = netNodes[i];
       n.e = freqData ? Math.min((freqData[n.band]/255)*gain*syncGain, 1.3) : 0;
@@ -651,7 +665,8 @@
       let bx = n.hx*hw + Math.cos(n.phase)*rr;         // base (home + drift)
       let by = n.hy*hh + Math.sin(n.phase*1.3)*rr;
       if (inFig){                                       // pull toward this shape's point
-        const sx = shp.pts[i][0]*hw, sy = shp.pts[i][1]*hh;
+        const px = shp.pts[i][0]*hw, py = shp.pts[i][1]*hh;
+        const sx = px*fcs - py*fsn, sy = px*fsn + py*fcs;   // spin the silhouette
         bx = bx*(1-coh) + sx*coh;
         by = by*(1-coh) + sy*coh;
         n.e = Math.max(n.e, coh*0.55);                  // keep the silhouette lit
