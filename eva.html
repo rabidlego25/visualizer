@@ -304,6 +304,8 @@
   uniform float u_exposure;     // auto-exposure: <1 during sustained-loud passages
   uniform float u_safe;         // 1 = full effects, low = reduced motion/flashing
   uniform float u_coh;          // 0..1 coalescence: background quiets so the figure reads
+  uniform float u_coil;         // 0..1 tension winding up (build) -> brighter
+  uniform float u_burst;        // 0..1 release exhale -> flash + outward pop
   const int MAXF = 24;          // silhouette outline points (closed polygon)
   uniform vec2  u_fig[MAXF];    // figure outline in uv space (already spun/placed by JS)
   uniform int   u_figN;         // active outline point count (0 = no figure)
@@ -408,18 +410,21 @@
     }
     return d*s;
   }
-  // solid glowing silhouette: colored fill + inner gradient + hot rim, gated by u_coh
-  vec3 figure(vec2 uv){
+  // glowing energy construct: gradient interior + holo scanlines + bright rim,
+  // so it reads as light rather than a flat slab. Gated by u_coh.
+  vec3 figure(vec2 uv, float t){
     if (u_coh < 0.01 || u_figN < 3) return vec3(0.0);
-    float sdf  = figSDF(uv);
-    float fill = smoothstep(0.006, -0.006, sdf);          // crisp solid body
-    float inner= smoothstep(-0.02, -0.16, sdf);           // interior depth
-    float rim  = smoothstep(0.020, 0.0, abs(sdf));         // outline band
-    vec3 body  = mix(u_figA, u_figB, 0.30 + 0.30*u_beat);
-    vec3 col   = body * fill * (0.55 + u_bass*0.55);
-    col += body   * inner * 0.30;
-    col += u_figB * rim * (1.1 + u_beat*0.9);
-    col += vec3(1.0,0.97,0.9) * smoothstep(0.005,0.0,abs(sdf)) * 0.7;  // hot core line
+    float sdf   = figSDF(uv);
+    float fill  = smoothstep(0.004, -0.004, sdf);          // inside mask
+    float depth = smoothstep(-0.30, 0.0, sdf);             // 0 deep-inside -> 1 at edge
+    float edge  = smoothstep(0.020, 0.0, abs(sdf));        // outline band
+    float scan  = 0.5 + 0.5*sin(uv.y*150.0 - t*4.0);       // holo scanlines
+    // interior is a soft gradient (brighter toward the rim) -> the field breathes,
+    // background still reads through it, no blown-out solid slab
+    vec3 col  = u_figA * fill * (0.14 + depth*0.42) * (0.6 + u_bass*0.6);
+    col += u_figA * fill * scan * 0.07;                     // faint scan texture
+    col += u_figB * edge * (1.2 + u_beat*1.0);              // bright rim
+    col += vec3(1.0,0.97,0.9) * smoothstep(0.004,0.0,abs(sdf)) * 0.55;  // hot core line
     return col * u_coh;
   }
 
@@ -482,8 +487,9 @@
   void main(){
     vec2 uv = (gl_FragCoord.xy - 0.5*u_res) / u_res.y;
     float t = u_time;
-    // beat "punch": zoom + rotation kick on every hit for kinetic impact
-    uv /= (1.0 + u_beat*0.08*u_safe);
+    // beat "punch": zoom + rotation kick on every hit for kinetic impact; the
+    // release adds a brief outward pop so the drop lands physically.
+    uv /= (1.0 + (u_beat*0.08 + u_burst*0.05)*u_safe);
     float rk = u_beat*0.03*u_safe;
     uv = mat2(cos(rk),-sin(rk),sin(rk),cos(rk)) * uv;
 
@@ -507,7 +513,8 @@
     // ...but as the figure coalesces the web RECEDES so the solid silhouette dominates
     // (fixes the old "sync high = unreadable bright blob").
     vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7) * (1.0 - u_coh*0.85);
-    vec3 fig = figure(uv);
+    net *= (1.0 + u_coil*0.35 + u_burst*0.6);          // tension glows; release flashes
+    vec3 fig = figure(uv, t);
     vec3 col = scn + net + fig;
 
     // ---- VIVID grade (Testify / anime pop) ----
@@ -548,7 +555,7 @@
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     // uniforms
-    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net','u_exposure','u_safe','u_coh','u_fig','u_figN','u_figA','u_figB'])
+    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net','u_exposure','u_safe','u_coh','u_coil','u_burst','u_fig','u_figN','u_figA','u_figB'])
       uni[n] = gl.getUniformLocation(prog, n);
     // fft texture
     const bins = analyser ? analyser.frequencyBinCount : 1024;
@@ -571,6 +578,10 @@
   // modulates the neural web's energy each frame (the automatic version of nudging
   // the Sync slider), so the whole scene surges & settles on its own.
   let syncRatio = 0.6, syncWander = 0;
+  // breathing: the web reads the song's ARC, not just loudness. Tension INTEGRATES
+  // while energy is rising (a build), relaxes on plateaus/quiet, and releases in an
+  // outward burst on a drop (a sharp energy jump). Tuned via an offline envelope sim.
+  let energyFast = 0, energyMed = 0, energyLag = 0, coil = 0, burst = 0, releaseLock = 0;
   // auto-exposure: a slow envelope of overall loudness. Transients spike bright
   // first (adapt hasn't caught up), then brightness settles as it rises.
   let expoAdapt=0;
@@ -591,6 +602,18 @@
     if (bass > bassSmooth*1.3 && bass > 0.32 && now-lastBeat>170) { beat=1; lastBeat=now; }
     beat *= 0.90;
     const energy = (bass*0.6+mid*0.3+treb*0.1);
+    // ---- breathing (in / out) ----
+    energyFast = energyFast*0.80 + energy*0.20;      // the moment
+    energyMed  = energyMed *0.90 + energy*0.10;      // slope reference
+    energyLag  = energyLag *0.92 + energy*0.08;      // jump reference
+    const slope = energyFast - energyMed;            // > 0 while the track is building
+    coil = Math.min(1, coil*0.985 + Math.max(0, slope)*2.0);   // tension accumulates on the rise
+    const jump = energyFast - energyLag;             // spikes at a drop
+    if (releaseLock > 0) releaseLock--;
+    if (coil > 0.30 && jump > 0.08 && releaseLock <= 0){        // the release
+      burst = Math.min(1.5, burst + coil*1.3); coil *= 0.25; releaseLock = 24;
+    }
+    burst *= 0.90;                                    // the exhale decays (~0.4s)
     syncSmooth = syncSmooth*0.90 + energy*0.10;
     // brownian wander (bounded) gives the gauge a live, drifting feel
     syncWander = Math.max(-1, Math.min(1, syncWander*0.97 + (Math.random()-0.5)*0.06));
@@ -658,27 +681,22 @@
 
   // ---- Evangelion coalescence ----------------------------------------------
   // Each shape is a CLOSED, non-self-intersecting outline in logical [-1,1] space,
-  // rendered as a solid filled silhouette by the shader's polygon SDF (see figure()).
-  // Original stylized forms (geometry + a generic humanoid), each with its own color.
-  // `spin` = base angular velocity (rad/s), scaled by audio: geometric forms tumble
-  // freely; humanoid form (spin 0) rocks gently instead of flipping upside-down.
+  // rendered as a glowing energy construct by the shader's polygon SDF (see figure()).
+  // Pure abstract geometry -- each with its own color and audio-scaled spin.
   const SHAPES = [
-    { name:'RAMIEL', spin:0.9, a:[0.12,0.30,0.98], b:[0.55,0.92,1.0], pts:[   // blue octahedron
+    { name:'OCTA', spin:0.9, a:[0.12,0.30,0.98], b:[0.55,0.92,1.0], pts:[     // octahedron / diamond
       [0,1],[0.5,0.5],[0.92,0.08],[0.92,-0.08],[0.5,-0.5],
       [0,-1],[-0.5,-0.5],[-0.92,-0.08],[-0.92,0.08],[-0.5,0.5] ] },
-    { name:'SENTINEL', spin:0, a:[0.42,0.13,0.64], b:[0.28,1.0,0.5], pts:[    // purple/green mask
-      [0,1.12],[0.16,0.55],[0.5,0.5],[0.66,0.05],[0.42,-0.5],
-      [0,-0.9],[-0.42,-0.5],[-0.66,0.05],[-0.5,0.5],[-0.16,0.55] ] },
-    { name:'PILOT', spin:0, a:[0.88,0.22,0.20], b:[1.0,0.72,0.32], pts:[      // humanoid silhouette
-      [0,1.05],[0.17,0.9],[0.17,0.68],[0.48,0.58],[0.5,0.5],[0.32,0.15],[0.46,-0.5],
-      [0.24,-0.52],[0.28,-1.05],[0.06,-1.05],[0.06,-0.5],[-0.06,-0.5],[-0.06,-1.05],
-      [-0.28,-1.05],[-0.24,-0.52],[-0.46,-0.5],[-0.32,0.15],[-0.5,0.5],[-0.48,0.58],
-      [-0.17,0.68],[-0.17,0.9] ] },
+    { name:'HEX', spin:1.1, a:[1.0,0.5,0.08], b:[1.0,0.82,0.35], pts:[        // hexagon
+      [0,1],[0.87,0.5],[0.87,-0.5],[0,-1],[-0.87,-0.5],[-0.87,0.5] ] },
     { name:'CROSS', spin:0.5, a:[1.0,0.82,0.45], b:[1.0,1.0,0.92], pts:[      // cruciform
       [-0.16,1],[0.16,1],[0.16,0.16],[0.9,0.16],[0.9,-0.16],[0.16,-0.16],
       [0.16,-1],[-0.16,-1],[-0.16,-0.16],[-0.9,-0.16],[-0.9,0.16],[-0.16,0.16] ] },
-    { name:'AT-FIELD', spin:1.1, a:[1.0,0.5,0.08], b:[1.0,0.82,0.35], pts:[   // hexagon
-      [0,1],[0.87,0.5],[0.87,-0.5],[0,-1],[-0.87,-0.5],[-0.87,0.5] ] },
+    { name:'STAR', spin:0.7, a:[0.70,0.15,0.90], b:[1.0,0.5,0.95], pts:[      // 6-point star burst
+      [0,1],[0.21,0.364],[0.866,0.5],[0.42,0],[0.866,-0.5],[0.21,-0.364],
+      [0,-1],[-0.21,-0.364],[-0.866,-0.5],[-0.42,0],[-0.866,0.5],[-0.21,0.364] ] },
+    { name:'TRI', spin:0.8, a:[0.10,0.85,0.55], b:[0.6,1.0,0.85], pts:[       // triangle
+      [0,1],[0.87,-0.5],[-0.87,-0.5] ] },
   ];
   let coh = 0, shapeIdx = 0, shapeDwell = 0;
   let shapeSpin = 0, netTime = 0;   // accumulating figure rotation + local clock
@@ -716,8 +734,11 @@
       // converges inward and the shader fades the web out, leaving the solid figure.
       const rr = n.r*(1 + n.e*0.9) + beat*0.05;
       const gather = 1 - coh*0.30;
-      let bx = (n.hx*hw + Math.cos(n.phase)*rr) * gather;   // base (home + drift)
-      let by = (n.hy*hh + Math.sin(n.phase*1.3)*rr) * gather;
+      // breathing: coil contracts the whole constellation inward (tension winding
+      // up); burst throws it outward on the release. Scales around center.
+      const breathe = (1 - coil*0.5) * (1 + burst*0.9);
+      let bx = (n.hx*hw + Math.cos(n.phase)*rr) * gather * breathe;   // base (home + drift)
+      let by = (n.hy*hh + Math.sin(n.phase*1.3)*rr) * gather * breathe;
       // cursor influence: DRAG pulls nodes toward the cursor; a bare HOVER pushes
       // them away (repulsion). Both use a spring + damping so they settle naturally.
       let tx = 0, ty = 0;
@@ -765,10 +786,12 @@
         }
       } else { edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99; }
     }
-    // build the solid figure outline: spin each point, scale to uv, upload as u_fig
+    // build the figure outline: spin each point, scale to uv, upload as u_fig.
+    // 0.62 keeps the construct floating in frame instead of filling it.
     const pts = shp.pts, fn = Math.min(pts.length, MAXF);
+    const fhw = hw*0.62, fhh = hh*0.62;
     for (let i=0;i<fn;i++){
-      const px = pts[i][0]*hw, py = pts[i][1]*hh;
+      const px = pts[i][0]*fhw, py = pts[i][1]*fhh;
       figBuf[i*2]   = px*fcs - py*fsn;
       figBuf[i*2+1] = px*fsn + py*fcs;
     }
@@ -783,6 +806,8 @@
     gl.uniform4fv(uni.u_edges, edgeBuf);
     gl.uniform1f(uni.u_net, netOn ? 1 : 0);
     gl.uniform1f(uni.u_coh, netOn ? coh : 0);
+    gl.uniform1f(uni.u_coil, coil);
+    gl.uniform1f(uni.u_burst, burst);
     gl.uniform2fv(uni.u_fig, figBuf);
     gl.uniform1i(uni.u_figN, figN);
     gl.uniform3fv(uni.u_figA, figA);
@@ -1037,6 +1062,8 @@
       // coalescence override for headless verification: ?coh=1&shape=2
       if (P.has('coh'))   testCoh = tp('coh',1);
       if (P.has('shape')) shapeIdx = Math.max(0, Math.min(SHAPES.length-1, tp('shape',0)|0));
+      if (P.has('coil'))  coil  = tp('coil',0);   // breathing overrides for headless verify
+      if (P.has('burst')) burst = tp('burst',0);
       // simulate cursor for headless verification: ?mx=..&my=..&md=1 (drag) or &mh=1 (hover)
       mouse.x = tp('mx',0); mouse.y = tp('my',0);
       mouse.down = tp('md',0) > 0.5; mouse.over = mouse.down || tp('mh',0) > 0.5;
@@ -1056,6 +1083,7 @@
         gl.uniform3fv(uni.u_nodes, nodeBuf); gl.uniform4fv(uni.u_edges, edgeBuf);
         gl.uniform1f(uni.u_net, netOn?1:0);
         gl.uniform1f(uni.u_coh, netOn ? coh : 0);
+        gl.uniform1f(uni.u_coil, coil); gl.uniform1f(uni.u_burst, burst);
         gl.uniform2fv(uni.u_fig, figBuf); gl.uniform1i(uni.u_figN, figN);
         gl.uniform3fv(uni.u_figA, figA); gl.uniform3fv(uni.u_figB, figB);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
