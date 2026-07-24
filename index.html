@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sound Visualizers — react to any track, record, and post</title>
+<meta name="description" content="Free browser-based music visualizers. Load any audio or use your mic, then record a video for your socials. No install, no signup.">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #06060a;
+    --text: #eaeaf2;
+    --muted: #9797ad;
+    --accent: #7c5cff;
+  }
+  html, body { min-height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  /* animated aurora backdrop */
+  .bgfx {
+    position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none;
+  }
+  .blob {
+    position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.5;
+    animation: drift 18s ease-in-out infinite alternate;
+  }
+  .blob.a { width: 46vw; height: 46vw; background: #7c5cff; top: -10vw; left: -8vw; }
+  .blob.b { width: 40vw; height: 40vw; background: #ff3b5c; bottom: -12vw; right: -6vw; animation-delay: -6s; }
+  .blob.c { width: 34vw; height: 34vw; background: #28e0c8; top: 30vh; right: 20vw; animation-delay: -11s; }
+  @keyframes drift { to { transform: translate(6vw, 8vh) scale(1.15); } }
+
+  .wrap { position: relative; z-index: 1; flex: 1; width: 100%; max-width: 1080px; margin: 0 auto; padding: 6vh 24px 40px; }
+
+  header { text-align: center; margin-bottom: 6vh; }
+  .kicker { font-size: 13px; letter-spacing: 4px; text-transform: uppercase; color: var(--muted); margin-bottom: 16px; }
+  h1 { font-size: clamp(34px, 7vw, 68px); line-height: 1.02; font-weight: 800; letter-spacing: -1.5px; }
+  h1 .grad {
+    background: linear-gradient(100deg, #7c5cff, #4cc9ff 40%, #ff5ea8 75%, #ff9d3c);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .sub { margin: 22px auto 0; max-width: 620px; font-size: clamp(15px, 2.2vw, 19px); color: var(--muted); line-height: 1.6; }
+
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 2vh; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+
+  a.card {
+    display: block; text-decoration: none; color: inherit;
+    border-radius: 18px; padding: 26px; position: relative; overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.10);
+    background: rgba(255,255,255,0.04);
+    backdrop-filter: blur(12px);
+    transition: transform 0.18s ease, border-color 0.18s, box-shadow 0.18s;
+    min-height: 260px;
+  }
+  a.card:hover { transform: translateY(-6px); border-color: rgba(255,255,255,0.25); box-shadow: 0 24px 60px rgba(0,0,0,0.5); }
+  .card .preview {
+    height: 120px; border-radius: 12px; margin-bottom: 20px; position: relative; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  /* Pulse preview */
+  .p-pulse { background: radial-gradient(circle at 50% 60%, #16082e, #0a0618); }
+  .p-pulse .rings { width: 90px; height: 90px; border-radius: 50%;
+    background: conic-gradient(#7c5cff, #4cc9ff, #ff5ea8, #c04cff, #7c5cff);
+    filter: blur(2px); animation: spin 6s linear infinite; opacity: 0.9; }
+  .p-pulse .core { position: absolute; width: 34px; height: 34px; border-radius: 50%; background: #fff; filter: blur(6px); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* EVA preview */
+  .p-eva { background: radial-gradient(circle at 50% 55%, #1a0d00, #000); }
+  .p-eva .hex { position: absolute; inset: 0;
+    background-image: repeating-linear-gradient(60deg, rgba(255,140,26,0.16) 0 1px, transparent 1px 22px),
+                      repeating-linear-gradient(-60deg, rgba(255,140,26,0.16) 0 1px, transparent 1px 22px),
+                      repeating-linear-gradient(0deg, rgba(255,140,26,0.10) 0 1px, transparent 1px 22px); }
+  .p-eva .eye { width: 40px; height: 40px; border-radius: 50%; background: #ff8c1a; filter: blur(3px); box-shadow: 0 0 30px #ff5a1a; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { transform: scale(1.25); box-shadow: 0 0 46px #ff5a1a; } }
+
+  .card h2 { font-size: 22px; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+  .card .tag { font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; padding: 3px 8px; border-radius: 6px; background: rgba(255,255,255,0.1); color: var(--muted); }
+  .card p { color: var(--muted); font-size: 14px; line-height: 1.55; }
+  .card .go { margin-top: 16px; font-weight: 600; color: var(--text); font-size: 14px; }
+  .card .go::after { content: " →"; }
+
+  .features { display: flex; flex-wrap: wrap; gap: 10px 26px; justify-content: center; margin-top: 6vh; color: var(--muted); font-size: 14px; }
+  .features span::before { content: "✦ "; color: var(--accent); }
+
+  footer { position: relative; z-index: 1; text-align: center; padding: 26px; color: var(--muted); font-size: 13px; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="bgfx"><div class="blob a"></div><div class="blob b"></div><div class="blob c"></div></div>
+
+  <div class="wrap">
+    <header>
+      <div class="kicker">Free · Browser-based · No signup</div>
+      <h1>Turn any sound into<br><span class="grad">something worth posting</span></h1>
+      <p class="sub">Load a track or use your mic, watch it come alive, then hit record and save a video for your socials. Everything runs in your browser — nothing is uploaded anywhere.</p>
+    </header>
+
+    <div class="cards">
+      <a class="card" href="pulse.html">
+        <div class="preview p-pulse"><div class="rings"></div><div class="core"></div></div>
+        <h2>Pulse <span class="tag">Canvas</span></h2>
+        <p>Four vivid styles — radial aurora, frequency bars, waveform ribbon, and an explosive particle orbit. Five color palettes and social-ready aspect ratios.</p>
+        <div class="go">Open Pulse</div>
+      </a>
+
+      <a class="card" href="eva.html">
+        <div class="preview p-eva"><div class="hex"></div><div class="eye"></div></div>
+        <h2>MAGI <span class="tag">WebGL · GPU</span></h2>
+        <p>A Neon-Genesis-inspired NERV terminal: GPU-rendered AT-field hex grid, a pulsing eye-core, cruciform beat-bursts, and a live neural network racing with data packets.</p>
+        <div class="go">Open MAGI</div>
+      </a>
+    </div>
+
+    <div class="features">
+      <span>Load audio or use mic</span>
+      <span>Scrub the timeline</span>
+      <span>Record to video</span>
+      <span>Vertical / square / wide</span>
+      <span>Works offline</span>
+    </div>
+  </div>
+
+  <footer>
+    Built with the Web Audio API + Canvas / WebGL. Open-source. <a href="https://github.com/rabidlego25/visualizer" id="repolink">View source</a>.
+  </footer>
+</body>
+</html>

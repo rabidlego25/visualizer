@@ -1,0 +1,6 @@
+.DS_Store
+.claude/
+scratchpad/
+*.jpg
+*.jpeg
+*.png

@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulse — Sound Visualizer</title>
+<style>
+  :root {
+    --bg: #07070c;
+    --panel: rgba(20, 20, 32, 0.72);
+    --border: rgba(255, 255, 255, 0.08);
+    --text: #e8e8f0;
+    --muted: #8a8aa0;
+    --accent: #7c5cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Stage */
+  #stage {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    min-height: 0;
+    padding: 20px;
+  }
+  #canvas {
+    background: #000;
+    border-radius: 14px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+    max-width: 100%;
+    max-height: 100%;
+  }
+
+  /* Drop hint overlay */
+  #hint {
+    position: absolute;
+    inset: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    pointer-events: none;
+    text-align: center;
+    color: var(--muted);
+    transition: opacity 0.4s;
+  }
+  #hint .big { font-size: 22px; font-weight: 600; color: var(--text); }
+  #hint .small { font-size: 14px; }
+  #hint.hidden { opacity: 0; }
+  #dropzone.dragging #canvas { filter: brightness(1.3); }
+
+  /* Control bar */
+  #controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    background: var(--panel);
+    backdrop-filter: blur(20px);
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .group { display: flex; align-items: center; gap: 8px; }
+  .sep { width: 1px; height: 26px; background: var(--border); margin: 0 4px; }
+
+  button, .filebtn {
+    background: rgba(255,255,255,0.06);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 9px 14px;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.05s;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+  }
+  button:hover, .filebtn:hover { background: rgba(255,255,255,0.12); }
+  button:active { transform: scale(0.96); }
+  button.primary { background: var(--accent); border-color: transparent; }
+  button.primary:hover { background: #8f73ff; }
+  button.rec { background: #ff3b5c; border-color: transparent; }
+  button.rec:hover { background: #ff5470; }
+  button:disabled { opacity: 0.35; cursor: default; }
+  button.active { background: var(--accent); border-color: transparent; }
+
+  label.field { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  select {
+    background: rgba(255,255,255,0.06);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  input[type=range] { accent-color: var(--accent); cursor: pointer; width: 90px; }
+  input[type=file] { display: none; }
+
+  #recDot {
+    display: none;
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #ff3b5c;
+    animation: blink 1s infinite;
+  }
+  @keyframes blink { 50% { opacity: 0.25; } }
+  #timer { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); min-width: 42px; }
+
+  .brand { font-weight: 700; letter-spacing: 1px; font-size: 15px; margin-right: 4px; }
+  .brand span { color: var(--accent); }
+
+  /* Seek bar */
+  #seekbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 20px;
+    background: var(--panel);
+    backdrop-filter: blur(20px);
+    border-top: 1px solid var(--border);
+  }
+  #seekbar.disabled { opacity: 0.4; }
+  #seek { flex: 1; width: auto; height: 6px; }
+  .tlabel { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 40px; }
+  .tlabel:last-child { text-align: right; }
+
+  @media (max-width: 720px) {
+    .brand, .sep { display: none; }
+    #controls { padding: 10px; gap: 6px; }
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div id="dropzone">
+      <canvas id="canvas"></canvas>
+    </div>
+    <div id="hint">
+      <div class="big">Drop an audio file to begin</div>
+      <div class="small">or use the buttons below · MP3, WAV, M4A · or your microphone</div>
+    </div>
+  </div>
+
+  <div id="seekbar" class="disabled">
+    <span id="curTime" class="tlabel">0:00</span>
+    <input type="range" id="seek" min="0" max="1000" value="0" step="1" disabled>
+    <span id="durTime" class="tlabel">0:00</span>
+  </div>
+
+  <div id="controls">
+    <a class="brand" href="index.html" title="← All visualizers" style="text-decoration:none;color:inherit">PULSE<span>.</span></a>
+
+    <div class="group">
+      <label class="filebtn" for="fileInput">🎵 Load audio</label>
+      <input type="file" id="fileInput" accept="audio/*">
+      <button id="micBtn">🎤 Mic</button>
+      <button id="playBtn" class="primary" disabled>▶︎ Play</button>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
+      <label class="field">Style
+        <select id="styleSel">
+          <option value="radial">Radial Aurora</option>
+          <option value="bars">Frequency Bars</option>
+          <option value="wave">Waveform Ribbon</option>
+          <option value="orbit">Particle Orbit</option>
+        </select>
+      </label>
+      <label class="field">Palette
+        <select id="paletteSel">
+          <option value="0">Nebula</option>
+          <option value="1">Sunset</option>
+          <option value="2">Aqua</option>
+          <option value="3">Fire</option>
+          <option value="4">Mono</option>
+        </select>
+      </label>
+      <label class="field">Format
+        <select id="ratioSel">
+          <option value="9:16">Vertical 9:16</option>
+          <option value="1:1">Square 1:1</option>
+          <option value="16:9" selected>Wide 16:9</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
+      <label class="field">Sensitivity <input type="range" id="gainSlider" min="0.5" max="3" step="0.1" value="1.4"></label>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
+      <button id="recBtn" class="rec" disabled>● Record</button>
+      <span id="recDot"></span>
+      <span id="timer">0:00</span>
+    </div>
+  </div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- Elements ----------
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const hint = document.getElementById('hint');
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('fileInput');
+  const micBtn = document.getElementById('micBtn');
+  const playBtn = document.getElementById('playBtn');
+  const styleSel = document.getElementById('styleSel');
+  const paletteSel = document.getElementById('paletteSel');
+  const ratioSel = document.getElementById('ratioSel');
+  const gainSlider = document.getElementById('gainSlider');
+  const recBtn = document.getElementById('recBtn');
+  const recDot = document.getElementById('recDot');
+  const timerEl = document.getElementById('timer');
+  const seekbar = document.getElementById('seekbar');
+  const seek = document.getElementById('seek');
+  const curTime = document.getElementById('curTime');
+  const durTime = document.getElementById('durTime');
+
+  // ---------- Palettes (each: array of hue-ish colors used across styles) ----------
+  const PALETTES = [
+    { name:'Nebula', bg:['#0a0618','#16082e'], stops:['#7c5cff','#c04cff','#4cc9ff','#ff5ea8'] },
+    { name:'Sunset', bg:['#1a0806','#2a0d1a'], stops:['#ff9d3c','#ff4d6d','#c04cff','#ffd23c'] },
+    { name:'Aqua',   bg:['#02121a','#031f2e'], stops:['#28e0c8','#3ca0ff','#7c5cff','#28ffb0'] },
+    { name:'Fire',   bg:['#180402','#2a0a02'], stops:['#ffd23c','#ff7b00','#ff2e2e','#ff9d3c'] },
+    { name:'Mono',   bg:['#0a0a0f','#15151f'], stops:['#ffffff','#c8c8ff','#9090c0','#e0e0ff'] },
+  ];
+
+  // ---------- Audio ----------
+  let audioCtx = null, analyser = null, sourceNode = null;
+  let mediaEl = null;         // <audio> element for files
+  let micStream = null;
+  let freqData = null, timeData = null;
+  let destNode = null;        // for capturing audio into recording
+  let currentObjectURL = null;
+
+  function ensureAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0.82;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
+    destNode = audioCtx.createMediaStreamDestination();
+  }
+
+  function disconnectSource() {
+    if (sourceNode) { try { sourceNode.disconnect(); } catch(e){} sourceNode = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (mediaEl) { mediaEl.pause(); }
+  }
+
+  function connectAnalyser(node, toSpeakers) {
+    node.connect(analyser);
+    analyser.connect(destNode);           // always feed the recorder
+    if (toSpeakers) analyser.connect(audioCtx.destination);
+  }
+
+  // Load an audio file
+  function loadFile(file) {
+    ensureAudio();
+    disconnectSource();
+    if (currentObjectURL) URL.revokeObjectURL(currentObjectURL);
+    currentObjectURL = URL.createObjectURL(file);
+    if (!mediaEl) {
+      mediaEl = new Audio();
+      mediaEl.crossOrigin = 'anonymous';
+      // wire the seek bar to this audio element once
+      mediaEl.addEventListener('loadedmetadata', () => {
+        durTime.textContent = fmtTime(mediaEl.duration);
+        seek.disabled = false;
+        seekbar.classList.remove('disabled');
+      });
+      mediaEl.addEventListener('timeupdate', () => {
+        if (seeking) return;              // don't fight the user while dragging
+        if (mediaEl.duration) {
+          seek.value = (mediaEl.currentTime / mediaEl.duration) * 1000;
+          curTime.textContent = fmtTime(mediaEl.currentTime);
+        }
+      });
+    }
+    mediaEl.src = currentObjectURL;
+    mediaEl.loop = false;
+    mediaEl.onended = () => { playBtn.textContent = '▶︎ Play'; };
+    sourceNode = audioCtx.createMediaElementSource(mediaEl);
+    connectAnalyser(sourceNode, true);
+    playBtn.disabled = false;
+    recBtn.disabled = false;
+    hideHint();
+    startRender();
+    play();
+  }
+
+  function fmtTime(s) {
+    if (!isFinite(s)) return '0:00';
+    s = Math.floor(s);
+    return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+  }
+
+  async function useMic() {
+    ensureAudio();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        echoCancellation: false, noiseSuppression: false, autoGainControl: false
+      }});
+      disconnectSource();
+      micStream = stream;
+      sourceNode = audioCtx.createMediaStreamSource(stream);
+      connectAnalyser(sourceNode, false);   // don't route mic to speakers (feedback)
+      playBtn.disabled = true;
+      recBtn.disabled = false;
+      seek.disabled = true;                 // live mic has no timeline
+      seekbar.classList.add('disabled');
+      curTime.textContent = durTime.textContent = '0:00';
+      hideHint();
+      startRender();
+    } catch (e) {
+      alert('Could not access microphone: ' + e.message);
+    }
+  }
+
+  function play() {
+    if (!mediaEl) return;
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    if (mediaEl.paused) { mediaEl.play(); playBtn.textContent = '❚❚ Pause'; }
+    else { mediaEl.pause(); playBtn.textContent = '▶︎ Play'; }
+  }
+
+  function hideHint() { hint.classList.add('hidden'); }
+
+  // ---------- Canvas sizing ----------
+  // Preview renders at 720p to keep CPU low; recording bumps to 1080p for crisp
+  // output. Anything reading W/H after a resize gets the current internal size.
+  let W = 0, H = 0;
+  let renderH = 720;   // internal render height; set to 1080 while recording
+  function resize() {
+    const [rw, rh] = ratioSel.value.split(':').map(Number);
+    const stage = document.getElementById('stage');
+    const availW = stage.clientWidth - 40;
+    const availH = stage.clientHeight - 40;
+    let cw = availW, ch = cw * rh / rw;
+    if (ch > availH) { ch = availH; cw = ch * rw / rh; }
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+    H = renderH; W = Math.round(renderH * rw / rh);
+    canvas.width = W; canvas.height = H;
+    bgCacheKey = '';   // force background gradient rebuild at the new size
+  }
+
+  // ---------- Frequency analysis helpers ----------
+  function bandEnergy(lo, hi) {
+    // average of a slice of the frequency data, normalized 0..1
+    let sum = 0, n = 0;
+    for (let i = lo; i < hi && i < freqData.length; i++) { sum += freqData[i]; n++; }
+    return n ? (sum / n) / 255 : 0;
+  }
+
+  // smoothed beat / bass tracker
+  let bassSmooth = 0, beatFlash = 0, lastBeat = 0;
+  function trackBeat(bass, t) {
+    bassSmooth = bassSmooth * 0.92 + bass * 0.08;
+    if (bass > bassSmooth * 1.35 && bass > 0.35 && t - lastBeat > 180) {
+      beatFlash = 1; lastBeat = t;
+    }
+    beatFlash *= 0.90;
+  }
+
+  // ---------- Color helpers ----------
+  function lerpColor(a, b, t) {
+    const pa = hexToRgb(a), pb = hexToRgb(b);
+    return `rgb(${Math.round(pa[0]+(pb[0]-pa[0])*t)},${Math.round(pa[1]+(pb[1]-pa[1])*t)},${Math.round(pa[2]+(pb[2]-pa[2])*t)})`;
+  }
+  function hexToRgb(h) {
+    const n = parseInt(h.slice(1), 16);
+    return [(n>>16)&255, (n>>8)&255, n&255];
+  }
+  function paletteColor(pal, t) {
+    // t in 0..1 across the stops
+    const s = pal.stops;
+    const x = t * (s.length - 1);
+    const i = Math.floor(x);
+    const f = x - i;
+    return lerpColor(s[i], s[Math.min(i+1, s.length-1)], f);
+  }
+
+  // ---------- Particles (shared) ----------
+  const particles = [];
+  function spawnParticle(x, y, angle, speed, color, size, life) {
+    particles.push({ x, y, vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed, color, size, life, max: life });
+  }
+  function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx; p.y += p.vy; p.vx *= 0.98; p.vy *= 0.98; p.life--;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+  function drawParticles() {
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of particles) {
+      const a = p.life / p.max;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * a, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // ---------- Background ----------
+  // The base radial gradient never changes per-frame, so build it once and reuse
+  // it until the size or palette changes. Rebuilding it every frame was a big
+  // chunk of the CPU cost.
+  let bgGrad = null, bgCacheKey = '';
+  function drawBackground(pal, bass) {
+    const key = `${W}x${H}:${pal.name}`;
+    if (key !== bgCacheKey) {
+      bgGrad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W,H)*0.75);
+      bgGrad.addColorStop(0, pal.bg[1]);
+      bgGrad.addColorStop(1, pal.bg[0]);
+      bgCacheKey = key;
+    }
+    const g = bgGrad;
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    // subtle center glow that pulses with bass
+    if (bass > 0.05) {
+      const gg = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, W*0.4*(0.6+bass));
+      const c = paletteColor(pal, 0.3);
+      gg.addColorStop(0, c.replace('rgb', 'rgba').replace(')', `,${0.10*bass})`));
+      gg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = gg;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  // ================= VISUAL STYLES =================
+
+  let phase = 0;
+
+  function drawRadial(pal, gain, t) {
+    const cx = W/2, cy = H/2;
+    const bins = 128;
+    const baseR = Math.min(W, H) * 0.18;
+    const bass = bandEnergy(1, 12);
+    trackBeat(bass, t);
+
+    // rotating core glow
+    ctx.save();
+    ctx.translate(cx, cy);
+    const coreR = baseR * (0.72 + bass * 0.5 + beatFlash * 0.3);
+    const cg = ctx.createRadialGradient(0,0,0,0,0,coreR*1.6);
+    const cc = paletteColor(pal, 0.5);
+    cg.addColorStop(0, cc.replace('rgb','rgba').replace(')',`,${0.5+beatFlash*0.3})`));
+    cg.addColorStop(0.6, cc.replace('rgb','rgba').replace(')',',0.12)'));
+    cg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = cg;
+    ctx.beginPath(); ctx.arc(0,0,coreR*1.6,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // radial bars (mirrored around circle)
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(phase * 0.05);
+    ctx.globalCompositeOperation = 'lighter';
+    const step = (Math.PI * 2) / bins;
+    for (let i = 0; i < bins; i++) {
+      const fi = Math.floor(Math.pow(i / bins, 1.7) * (freqData.length * 0.5));
+      const v = (freqData[fi] / 255) * gain;
+      const len = v * baseR * 2.2;
+      const ang = i * step;
+      const col = paletteColor(pal, i / bins);
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 3 + v * 6;
+      ctx.lineCap = 'round';
+      ctx.shadowBlur = 14; ctx.shadowColor = col;
+      const r0 = baseR + coreR * 0.15;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(ang) * r0, Math.sin(ang) * r0);
+      ctx.lineTo(Math.cos(ang) * (r0 + len), Math.sin(ang) * (r0 + len));
+      ctx.stroke();
+      // beat particles from the tips
+      if (beatFlash > 0.5 && v > 0.5 && Math.random() < 0.25) {
+        spawnParticle(cx + Math.cos(ang)*(r0+len), cy + Math.sin(ang)*(r0+len), ang, 2+v*4, col, 3+v*3, 40+Math.random()*30);
+      }
+    }
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // inner waveform ring
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.beginPath();
+    const pts = 180;
+    for (let i = 0; i <= pts; i++) {
+      const idx = Math.floor(i / pts * timeData.length);
+      const amp = (timeData[idx] - 128) / 128;
+      const r = baseR * 0.55 + amp * baseR * 0.35 * gain;
+      const ang = (i / pts) * Math.PI * 2;
+      const x = Math.cos(ang) * r, y = Math.sin(ang) * r;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = paletteColor(pal, 0.15);
+    ctx.lineWidth = 2.5;
+    ctx.shadowBlur = 12; ctx.shadowColor = paletteColor(pal, 0.15);
+    ctx.stroke();
+    ctx.restore();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawBars(pal, gain, t) {
+    const bass = bandEnergy(1, 12);
+    trackBeat(bass, t);
+    const bins = 72;
+    const gap = 4;
+    const bw = (W - gap) / bins - gap;
+    const maxH = H * 0.7;
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < bins; i++) {
+      const fi = Math.floor(Math.pow(i / bins, 1.6) * (freqData.length * 0.5));
+      const v = (freqData[fi] / 255) * gain;
+      const h = Math.min(v * maxH, maxH);
+      const x = gap + i * (bw + gap);
+      const col = paletteColor(pal, i / bins);
+      const grad = ctx.createLinearGradient(0, H, 0, H - h);
+      grad.addColorStop(0, col.replace('rgb','rgba').replace(')',',0.25)'));
+      grad.addColorStop(1, col);
+      ctx.fillStyle = grad;
+      ctx.shadowBlur = 20; ctx.shadowColor = col;
+      roundRectFill(x, H*0.9 - h, bw, h, bw/2);
+      // reflection
+      ctx.globalAlpha = 0.15;
+      roundRectFill(x, H*0.9 + 4, bw, h*0.4, bw/2);
+      ctx.globalAlpha = 1;
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function roundRectFill(x, y, w, h, r) {
+    if (h <= 0) return;
+    r = Math.min(r, h/2, w/2);
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.fill();
+  }
+
+  function drawWave(pal, gain, t) {
+    const bass = bandEnergy(1, 12);
+    trackBeat(bass, t);
+    const cy = H/2;
+    const layers = 3;
+    ctx.globalCompositeOperation = 'lighter';
+    for (let L = 0; L < layers; L++) {
+      const off = (L - 1) * 40;
+      const alpha = 1 - L * 0.28;
+      ctx.beginPath();
+      const pts = 260;
+      for (let i = 0; i <= pts; i++) {
+        const idx = Math.floor(i / pts * timeData.length);
+        const amp = (timeData[idx] - 128) / 128;
+        const x = (i / pts) * W;
+        const wobble = Math.sin(i*0.05 + phase*0.06 + L) * 20;
+        const y = cy + off + amp * (H*0.32) * gain + wobble;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      const col = paletteColor(pal, L / layers * 0.6 + 0.1);
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = alpha * (0.6 + bass*0.4);
+      ctx.lineWidth = 3 + bass*4;
+      ctx.lineCap = 'round';
+      ctx.shadowBlur = 18; ctx.shadowColor = col;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // Orbit: particles orbiting a core that violently reacts and explodes on beats.
+  // Perf note: NO ctx.shadowBlur here — glow comes from a cached radial-gradient
+  // sprite drawn additively, which is dramatically cheaper than per-dot shadows.
+  const orbiters = [];
+  const shockwaves = [];   // expanding rings spawned on beats
+  const sparks = [];        // debris flung outward on beats
+  const MAX_SPARKS = 600;
+
+  // Colored glow sprites: each is a radial gradient that fades from a WHITE-HOT
+  // core through the particle's own color to transparent — the vivid look — but
+  // rendered once per color and cached, so per-frame cost is just a drawImage.
+  const SP = 64;
+  const tintCache = new Map();
+  function tintedGlow(rgb) {
+    let c = tintCache.get(rgb);
+    if (c) return c;
+    c = document.createElement('canvas');
+    c.width = c.height = SP;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(SP/2,SP/2,0, SP/2,SP/2,SP/2);
+    grd.addColorStop(0,    'rgba(255,255,255,1)');                       // hot center
+    grd.addColorStop(0.18, rgb.replace('rgb','rgba').replace(')',',1)'));
+    grd.addColorStop(0.55, rgb.replace('rgb','rgba').replace(')',',0.45)'));
+    grd.addColorStop(1,    rgb.replace('rgb','rgba').replace(')',',0)'));
+    g.fillStyle = grd;
+    g.fillRect(0,0,SP,SP);
+    if (tintCache.size < 300) tintCache.set(rgb, c);   // bound the cache
+    return c;
+  }
+  // Additive colored glow dot — draws the cached sprite scaled to size.
+  function glowDot(x, y, radius, rgb, alpha) {
+    const d = radius * 4;   // sprite is mostly transparent halo, so oversize it
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(tintedGlow(rgb), x - d/2, y - d/2, d, d);
+  }
+  // Restrict spark/shockwave colors to a small quantized set so the tint cache
+  // stays tiny (continuous random colors would blow it up).
+  function quantColor(pal, t) { return paletteColor(pal, Math.round(t*8)/8); }
+
+  function initOrbiters() {
+    orbiters.length = 0;
+    for (let i = 0; i < 190; i++) {
+      orbiters.push({
+        ang: Math.random()*Math.PI*2,
+        band: Math.floor(Math.random()*64),
+        speed: 0.006 + Math.random()*0.03,       // fast base spin
+        dir: Math.random() < 0.5 ? 1 : -1,        // some orbit backwards
+        rBase: 0.12 + Math.random()*0.38,
+        rNow: 0.25,
+        size: 1.5 + Math.random()*3.5
+      });
+    }
+  }
+  initOrbiters();
+
+  function drawOrbit(pal, gain, t) {
+    const cx = W/2, cy = H/2;
+    const bass = bandEnergy(1, 10);
+    const prevFlash = beatFlash;
+    trackBeat(bass, t);
+    const beatHit = beatFlash > prevFlash && beatFlash > 0.6;   // rising edge = fresh beat
+    const R = Math.min(W, H) * 0.5;
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    // ---- explosion on beat: shockwave ring + burst of sparks ----
+    if (beatHit) {
+      shockwaves.push({ r: R*0.10, life: 1, col: quantColor(pal, Math.random()) });
+      let burst = 30 + Math.floor(bass * 50);
+      if (sparks.length + burst > MAX_SPARKS) burst = Math.max(0, MAX_SPARKS - sparks.length);
+      for (let i = 0; i < burst; i++) {
+        const a = Math.random()*Math.PI*2;
+        const spd = (6 + Math.random()*22) * (0.6 + bass);
+        sparks.push({
+          x: cx, y: cy,
+          vx: Math.cos(a)*spd, vy: Math.sin(a)*spd,
+          life: 1, size: 1.5 + Math.random()*4,
+          col: quantColor(pal, Math.random())
+        });
+      }
+    }
+
+    // ---- pulsing core (kicks hard on beats) ----
+    const coreR = R*0.10*(1 + bass*1.3 + beatFlash*1.1);
+    glowDot(cx, cy, coreR*1.6, paletteColor(pal, 0.5), Math.min(1, 0.7 + beatFlash*0.3));
+
+    // ---- shockwave rings (few, so a light shadow is fine) ----
+    for (let i = shockwaves.length-1; i >= 0; i--) {
+      const s = shockwaves[i];
+      s.r += R * 0.06;         // expand fast
+      s.life -= 0.03;
+      if (s.life <= 0) { shockwaves.splice(i,1); continue; }
+      ctx.globalAlpha = s.life * 0.7;
+      ctx.strokeStyle = s.col;
+      ctx.lineWidth = 2 + s.life*10;
+      ctx.beginPath(); ctx.arc(cx, cy, s.r, 0, Math.PI*2); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // ---- orbiters: fast spin, radius snaps out on hits, springs back ----
+    for (const o of orbiters) {
+      const v = (freqData[o.band*2] / 255) * gain;
+      o.ang += o.speed * o.dir * (1 + v*3 + beatFlash*2);   // spin faster with energy & beats
+      const target = o.rBase + v*0.55 + beatFlash*0.5;       // snap outward on beats
+      o.rNow += (target - o.rNow) * 0.25;                    // springy motion
+      const r = R * o.rNow;
+      const x = cx + Math.cos(o.ang) * r;
+      const y = cy + Math.sin(o.ang) * r * 0.92;
+      const col = paletteColor(pal, o.band/64);
+      const sz = o.size * (0.6 + v*2.6 + beatFlash*1.2);
+      glowDot(x, y, sz, col, Math.min(1, 0.5 + v));
+    }
+
+    // ---- flying sparks / debris ----
+    for (let i = sparks.length-1; i >= 0; i--) {
+      const p = sparks[i];
+      p.x += p.vx; p.y += p.vy;
+      p.vx *= 0.96; p.vy *= 0.96;
+      p.life -= 0.02;
+      if (p.life <= 0) { sparks.splice(i,1); continue; }
+      glowDot(p.x, p.y, p.size*p.life, p.col, p.life);
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // ---------- Main render loop ----------
+  let rafId = null, running = false;
+  function frame(t) {
+    if (!running) return;
+    rafId = requestAnimationFrame(frame);
+    if (analyser) {
+      analyser.getByteFrequencyData(freqData);
+      analyser.getByteTimeDomainData(timeData);
+    }
+    phase++;
+    const pal = PALETTES[+paletteSel.value];
+    const gain = +gainSlider.value;
+    const bass = analyser ? bandEnergy(1, 12) : 0;
+
+    drawBackground(pal, bass);
+
+    switch (styleSel.value) {
+      case 'radial': drawRadial(pal, gain, t); break;
+      case 'bars':   drawBars(pal, gain, t); break;
+      case 'wave':   drawWave(pal, gain, t); break;
+      case 'orbit':  drawOrbit(pal, gain, t); break;
+    }
+
+    updateParticles();
+    drawParticles();
+  }
+  function startRender() {
+    if (running) return;
+    running = true;
+    rafId = requestAnimationFrame(frame);
+  }
+
+  // ---------- Recording ----------
+  let recorder = null, chunks = [], recStart = 0, recTimerId = null;
+  function startRecording() {
+    if (!audioCtx) return;
+    // Bump to full 1080p for the recording, then capture the stream at that size.
+    renderH = 1080; resize();
+    const canvasStream = canvas.captureStream(60);
+    // mix in the audio track from destNode
+    const tracks = [...canvasStream.getVideoTracks()];
+    if (destNode && destNode.stream.getAudioTracks().length) {
+      tracks.push(...destNode.stream.getAudioTracks());
+    }
+    const mixed = new MediaStream(tracks);
+    const mime = pickMime();
+    try {
+      recorder = new MediaRecorder(mixed, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
+    } catch (e) {
+      recorder = new MediaRecorder(mixed);
+    }
+    chunks = [];
+    recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = saveRecording;
+    recorder.start();
+    recStart = performance.now();
+    recDot.style.display = 'inline-block';
+    recBtn.textContent = '■ Stop';
+    recBtn.classList.add('active');
+    recTimerId = setInterval(updateTimer, 250);
+    // if a file is loaded and not playing, start it so the recording has audio
+    if (mediaEl && mediaEl.paused) play();
+  }
+  function pickMime() {
+    const opts = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+    for (const o of opts) if (MediaRecorder.isTypeSupported(o)) return o;
+    return 'video/webm';
+  }
+  function stopRecording() {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    recDot.style.display = 'none';
+    recBtn.textContent = '● Record';
+    recBtn.classList.remove('active');
+    clearInterval(recTimerId);
+    // drop back to the lighter 720p preview
+    renderH = 720; resize();
+  }
+  function saveRecording() {
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    a.href = url; a.download = `pulse-visualizer-${stamp}.webm`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+  function updateTimer() {
+    const s = Math.floor((performance.now() - recStart) / 1000);
+    timerEl.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+  }
+
+  // ---------- Events ----------
+  fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  micBtn.addEventListener('click', useMic);
+  playBtn.addEventListener('click', play);
+  recBtn.addEventListener('click', () => {
+    if (recorder && recorder.state === 'recording') stopRecording(); else startRecording();
+  });
+  ratioSel.addEventListener('change', resize);
+  styleSel.addEventListener('change', () => { particles.length = 0; });
+  paletteSel.addEventListener('change', () => { tintCache.clear(); });
+
+  // seek bar: scrub through the track
+  let seeking = false;
+  function seekPreview() {
+    if (!mediaEl || !mediaEl.duration) return;
+    curTime.textContent = fmtTime((seek.value / 1000) * mediaEl.duration);
+  }
+  function seekCommit() {
+    if (!mediaEl || !mediaEl.duration) return;
+    mediaEl.currentTime = (seek.value / 1000) * mediaEl.duration;
+    seeking = false;
+  }
+  seek.addEventListener('input', () => { seeking = true; seekPreview(); });
+  seek.addEventListener('change', seekCommit);           // fires on release
+  seek.addEventListener('pointerup', seekCommit);
+
+  // drag & drop
+  ['dragenter','dragover'].forEach(ev => document.addEventListener(ev, e => {
+    e.preventDefault(); dropzone.classList.add('dragging');
+  }));
+  ['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => {
+    e.preventDefault(); dropzone.classList.remove('dragging');
+  }));
+  document.addEventListener('drop', e => {
+    const f = e.dataTransfer.files[0];
+    if (f && f.type.startsWith('audio')) loadFile(f);
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  // idle animation so it isn't blank before audio loads
+  (function idle() {
+    if (!running) {
+      const pal = PALETTES[+paletteSel.value];
+      drawBackground(pal, 0.1 + 0.05*Math.sin(Date.now()/600));
+      requestAnimationFrame(idle);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

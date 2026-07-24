@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAGI — EVA Sound Visualizer</title>
+<style>
+  :root {
+    --bg: #050506;
+    --panel: rgba(12, 10, 8, 0.82);
+    --border: rgba(255, 140, 26, 0.25);
+    --amber: #ff8c1a;
+    --amber-dim: #a85c10;
+    --text: #ffce9e;
+    --muted: #8a6a44;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Courier New", ui-monospace, monospace;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #stage {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    position: relative; min-height: 0; padding: 16px;
+  }
+  /* The GL canvas renders offscreen-ish; the 2D canvas is what you see + record */
+  #gl { display: none; }
+  #view {
+    background: #000;
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(255,140,26,0.2), 0 24px 70px rgba(0,0,0,0.7),
+                0 0 60px rgba(255,80,20,0.08);
+    max-width: 100%; max-height: 100%;
+  }
+
+  #hint {
+    position: absolute; inset: 16px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    pointer-events: none; text-align: center; color: var(--muted);
+    transition: opacity 0.4s; letter-spacing: 2px;
+  }
+  #hint .big { font-size: 20px; font-weight: 700; color: var(--amber); text-transform: uppercase; }
+  #hint .small { font-size: 12px; }
+  #hint.hidden { opacity: 0; }
+
+  #controls, #seekbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; background: var(--panel);
+    backdrop-filter: blur(16px); border-top: 1px solid var(--border);
+    flex-wrap: wrap; justify-content: center;
+  }
+  #seekbar { padding: 7px 20px; gap: 12px; }
+  #seekbar.disabled { opacity: 0.4; }
+  .group { display: flex; align-items: center; gap: 8px; }
+  .sep { width: 1px; height: 24px; background: var(--border); margin: 0 4px; }
+
+  button, .filebtn {
+    background: rgba(255,140,26,0.08); color: var(--text);
+    border: 1px solid var(--border); padding: 8px 13px; border-radius: 4px;
+    font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 1px;
+    text-transform: uppercase; cursor: pointer; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 6px; user-select: none;
+    transition: background 0.15s, transform 0.05s;
+  }
+  button:hover, .filebtn:hover { background: rgba(255,140,26,0.2); }
+  button:active { transform: scale(0.96); }
+  button.primary { background: var(--amber); border-color: transparent; color: #1a0d00; }
+  button.rec { background: #e2231a; border-color: transparent; color: #fff; }
+  button:disabled { opacity: 0.3; cursor: default; }
+
+  label.field { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; letter-spacing: 1px; text-transform: uppercase; }
+  select {
+    background: rgba(255,140,26,0.06); color: var(--text);
+    border: 1px solid var(--border); padding: 7px 9px; border-radius: 4px;
+    font-family: inherit; font-size: 12px; cursor: pointer;
+  }
+  input[type=range] { accent-color: var(--amber); cursor: pointer; }
+  #seek { flex: 1; height: 5px; }
+  #gainSlider { width: 90px; }
+  input[type=file] { display: none; }
+  .tlabel { font-size: 12px; color: var(--muted); min-width: 44px; }
+  .tlabel:last-child { text-align: right; }
+  #recDot { display: none; width: 9px; height: 9px; border-radius: 50%; background: #e2231a; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0.25; } }
+  #timer { font-size: 12px; color: var(--muted); min-width: 42px; }
+  .brand { font-weight: 700; letter-spacing: 3px; font-size: 14px; color: var(--amber); margin-right: 4px; }
+
+  @media (max-width: 760px) { .brand, .sep { display: none; } #controls { padding: 9px; gap: 6px; } }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="gl"></canvas>
+    <canvas id="view"></canvas>
+    <div id="hint">
+      <div class="big">// SOUND ONLY</div>
+      <div class="small">DROP AUDIO FILE · OR USE CONTROLS BELOW · OR MICROPHONE</div>
+    </div>
+  </div>
+
+  <div id="seekbar" class="disabled">
+    <span id="curTime" class="tlabel">0:00</span>
+    <input type="range" id="seek" min="0" max="1000" value="0" step="1" disabled>
+    <span id="durTime" class="tlabel">0:00</span>
+  </div>
+
+  <div id="controls">
+    <a class="brand" href="index.html" title="← All visualizers" style="text-decoration:none;color:inherit">NERV</a>
+    <div class="group">
+      <label class="filebtn" for="fileInput">▷ Load</label>
+      <input type="file" id="fileInput" accept="audio/*">
+      <button id="micBtn">◉ Mic</button>
+      <button id="playBtn" class="primary" disabled>▶ Play</button>
+    </div>
+    <div class="sep"></div>
+    <div class="group">
+      <label class="field">Unit
+        <select id="themeSel">
+          <option value="0">01 · NERV Amber</option>
+          <option value="1">02 · Unit-01</option>
+          <option value="2">03 · Pattern Blue</option>
+          <option value="3">04 · Blood</option>
+        </select>
+      </label>
+      <label class="field">Format
+        <select id="ratioSel">
+          <option value="9:16">Vert 9:16</option>
+          <option value="1:1">Square 1:1</option>
+          <option value="16:9" selected>Wide 16:9</option>
+        </select>
+      </label>
+      <label class="field">Sync <input type="range" id="gainSlider" min="0.5" max="3" step="0.1" value="1.5"></label>
+      <button id="netBtn" class="primary">🧠 Neural</button>
+    </div>
+    <div class="sep"></div>
+    <div class="group">
+      <button id="recBtn" class="rec" disabled>● Rec</button>
+      <span id="recDot"></span>
+      <span id="timer">0:00</span>
+    </div>
+  </div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ============================================================
+  //  MAGI / EVA sound visualizer
+  //  - GPU fragment shader (WebGL2) renders the reactive scene.
+  //  - A 2D canvas blits the GPU frame + draws the NERV telemetry
+  //    HUD on top, and is the single surface we record.
+  //  NOTE: to move this to WebGPU later, only createRenderer() and
+  //  the shader source need to change; everything else is portable.
+  // ============================================================
+
+  const glCanvas  = document.getElementById('gl');
+  const view      = document.getElementById('view');
+  const vctx      = view.getContext('2d');
+  const hint      = document.getElementById('hint');
+  const fileInput = document.getElementById('fileInput');
+  const micBtn    = document.getElementById('micBtn');
+  const playBtn   = document.getElementById('playBtn');
+  const themeSel  = document.getElementById('themeSel');
+  const ratioSel  = document.getElementById('ratioSel');
+  const gainSlider= document.getElementById('gainSlider');
+  const recBtn    = document.getElementById('recBtn');
+  const recDot    = document.getElementById('recDot');
+  const timerEl   = document.getElementById('timer');
+  const netBtn    = document.getElementById('netBtn');
+  const seekbar   = document.getElementById('seekbar');
+  const seek      = document.getElementById('seek');
+  const curTime   = document.getElementById('curTime');
+  const durTime   = document.getElementById('durTime');
+
+  // Themes: [hot edge color, base edge color, HUD css color]
+  const THEMES = [
+    { c1:[1.0,0.55,0.12], c2:[0.95,0.10,0.05], hud:'#ff8c1a' }, // NERV amber
+    { c1:[0.55,1.0,0.18], c2:[0.55,0.12,0.95], hud:'#8cff3c' }, // Unit-01 green/purple
+    { c1:[0.35,0.75,1.0], c2:[0.10,0.25,0.95], hud:'#4cc9ff' }, // Pattern Blue
+    { c1:[1.0,0.25,0.15], c2:[0.55,0.02,0.02], hud:'#ff4530' }, // Blood
+  ];
+
+  // ---------------- Audio ----------------
+  let audioCtx=null, analyser=null, sourceNode=null, mediaEl=null, micStream=null;
+  let freqData=null, timeData=null, destNode=null, currentURL=null;
+
+  function ensureAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.80;
+    freqData = new Uint8Array(analyser.frequencyBinCount); // 1024
+    timeData = new Uint8Array(analyser.fftSize);
+    destNode = audioCtx.createMediaStreamDestination();
+  }
+  function disconnectSource() {
+    if (sourceNode) { try { sourceNode.disconnect(); } catch(e){} sourceNode=null; }
+    if (micStream) { micStream.getTracks().forEach(t=>t.stop()); micStream=null; }
+    if (mediaEl) mediaEl.pause();
+  }
+  function connect(node, toSpeakers) {
+    node.connect(analyser);
+    analyser.connect(destNode);
+    if (toSpeakers) analyser.connect(audioCtx.destination);
+  }
+  function loadFile(file) {
+    ensureAudio(); disconnectSource();
+    if (currentURL) URL.revokeObjectURL(currentURL);
+    currentURL = URL.createObjectURL(file);
+    if (!mediaEl) {
+      mediaEl = new Audio(); mediaEl.crossOrigin='anonymous';
+      mediaEl.addEventListener('loadedmetadata', () => {
+        durTime.textContent = fmt(mediaEl.duration);
+        seek.disabled=false; seekbar.classList.remove('disabled');
+      });
+      mediaEl.addEventListener('timeupdate', () => {
+        if (seeking || !mediaEl.duration) return;
+        seek.value = (mediaEl.currentTime/mediaEl.duration)*1000;
+        curTime.textContent = fmt(mediaEl.currentTime);
+      });
+    }
+    mediaEl.src = currentURL; mediaEl.loop=false;
+    mediaEl.onended = () => { playBtn.textContent='▶ Play'; };
+    sourceNode = audioCtx.createMediaElementSource(mediaEl);
+    connect(sourceNode, true);
+    playBtn.disabled=false; recBtn.disabled=false;
+    hint.classList.add('hidden'); startLoop(); play();
+  }
+  async function useMic() {
+    ensureAudio();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      disconnectSource(); micStream=stream;
+      sourceNode = audioCtx.createMediaStreamSource(stream);
+      connect(sourceNode, false);
+      playBtn.disabled=true; recBtn.disabled=false;
+      seek.disabled=true; seekbar.classList.add('disabled');
+      curTime.textContent=durTime.textContent='0:00';
+      hint.classList.add('hidden'); startLoop();
+    } catch(e) { alert('Microphone access failed: '+e.message); }
+  }
+  function play() {
+    if (!mediaEl) return;
+    if (audioCtx.state==='suspended') audioCtx.resume();
+    if (mediaEl.paused) { mediaEl.play(); playBtn.textContent='❚❚ Pause'; }
+    else { mediaEl.pause(); playBtn.textContent='▶ Play'; }
+  }
+  function fmt(s){ if(!isFinite(s))return '0:00'; s=Math.floor(s); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; }
+
+  // ---------------- Sizing ----------------
+  let W=0, H=0;
+  function resize() {
+    const [rw,rh] = ratioSel.value.split(':').map(Number);
+    const stage = document.getElementById('stage');
+    const aw = stage.clientWidth-32, ah = stage.clientHeight-32;
+    let cw=aw, ch=cw*rh/rw;
+    if (ch>ah) { ch=ah; cw=ch*rw/rh; }
+    view.style.width=cw+'px'; view.style.height=ch+'px';
+    H = 1080; W = Math.round(1080*rw/rh);          // GPU handles full 1080p
+    glCanvas.width=W; glCanvas.height=H;
+    view.width=W; view.height=H;
+    if (gl) gl.viewport(0,0,W,H);
+  }
+
+  // ---------------- WebGL2 renderer ----------------
+  let gl=null, prog=null, fftTex=null, uni={};
+  const VERT = `#version 300 es
+  in vec2 a_pos;
+  void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  uniform vec2  u_res;
+  uniform float u_time;
+  uniform float u_bass;
+  uniform float u_mid;
+  uniform float u_treble;
+  uniform float u_beat;
+  uniform vec3  u_c1;      // hot edge color
+  uniform vec3  u_c2;      // base edge color
+  uniform sampler2D u_fft; // 1D-ish frequency texture
+
+  const int MAXN = 30;     // neural nodes
+  const int MAXE = 46;     // neural edges
+  uniform vec3  u_nodes[MAXN];  // xy = position (uv space), z = energy 0..1
+  uniform vec4  u_edges[MAXE];  // (x1,y1) -> (x2,y2); padded entries use x>90
+  uniform float u_net;          // neural-net master intensity 0..1
+
+  float hexDist(vec2 p){ p = abs(p); return max(dot(p, vec2(0.866025,0.5)), p.y); }
+  vec4 hexCoords(vec2 uv){
+    vec2 r = vec2(1.0, 1.732050);
+    vec2 h = r*0.5;
+    vec2 a = mod(uv, r) - h;
+    vec2 b = mod(uv - h, r) - h;
+    vec2 gv = dot(a,a) < dot(b,b) ? a : b;
+    float y = 0.5 - hexDist(gv);
+    vec2 id = uv - gv;
+    return vec4(gv.x, y, id);
+  }
+  float fftAt(float t){ return texture(u_fft, vec2(clamp(t,0.0,1.0), 0.5)).r; }
+
+  // distance from point p to segment a-b
+  float segDist(vec2 p, vec2 a, vec2 b){
+    vec2 pa = p-a, ba = b-a;
+    float h = clamp(dot(pa,ba)/(dot(ba,ba)+1e-5), 0.0, 1.0);
+    return length(pa - ba*h);
+  }
+  // MAGI neural web: glowing synapse lines with data packets racing along them
+  vec3 neuralNet(vec2 uv, float t){
+    vec3 col = vec3(0.0);
+    vec3 lineCol = mix(u_c1, vec3(1.0), 0.35);
+    for (int i=0;i<MAXE;i++){
+      vec4 e = u_edges[i];
+      if (e.x > 90.0) continue;                       // padded / inactive edge
+      float d = segDist(uv, e.xy, e.zw);
+      col += lineCol * smoothstep(0.006,0.0,d) * 0.22; // soft synapse
+      col += lineCol * smoothstep(0.0016,0.0,d) * 0.6; // bright core
+      // fast-moving data packets (multiple per edge, speed surges on beats)
+      float seed = fract(sin(float(i)*13.19)*43758.5453);
+      for (int k=0;k<2;k++){
+        float sp  = 0.7 + seed*1.1 + u_beat*1.8;
+        float pos = fract(t*sp + seed + float(k)*0.5);
+        float pd  = length(uv - mix(e.xy, e.zw, pos));
+        col += vec3(1.0,0.96,0.86) * smoothstep(0.013,0.0,pd) * (0.85 + u_beat);
+      }
+    }
+    for (int i=0;i<MAXN;i++){
+      vec3 n = u_nodes[i];
+      if (n.x > 90.0) continue;
+      float nd = length(uv - n.xy);
+      col += mix(u_c2, u_c1, n.z) * smoothstep(0.018 + n.z*0.02, 0.0, nd) * (0.5 + n.z*1.6);
+      col += u_c1 * smoothstep(0.06, 0.0, nd) * n.z * 0.4;   // node halo
+    }
+    return col;
+  }
+
+  vec3 scene(vec2 uv, float t){
+    vec3 col = vec3(0.0);
+    float d = length(uv);
+
+    // --- AT-field hex grid ---
+    float scale = 6.5 + u_bass*2.5;
+    float ang = t*0.025;
+    mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
+    vec2 huv = rot * uv * scale;
+    vec4 hc = hexCoords(huv);
+    float line = 1.0 - smoothstep(0.0, 0.06, hc.y);   // bright at cell edges
+    float cellR = length(hc.zw);                       // ring index from center
+    float f = fftAt(cellR*0.045);                      // audio energy for this ring
+    float ripple = 0.5 + 0.5*sin(cellR*0.9 - t*3.2);   // expanding pulse
+    float glow = line * (0.10 + f*1.4 + u_beat*ripple*1.8);
+    vec3 hexCol = mix(u_c2, u_c1, clamp(f*1.6 + u_beat*0.5, 0.0, 1.0));
+    col += hexCol * glow;
+    // faint filled cells that flash on strong bands
+    col += hexCol * smoothstep(0.35,0.5,hc.y) * f * 0.25;
+
+    // --- central eye / S2 core ---
+    float coreR = 0.10 + u_bass*0.14 + u_beat*0.05;
+    float core  = smoothstep(coreR, 0.0, d);
+    float iris  = 0.5 + 0.5*sin(d*46.0 - t*2.2);
+    vec3 coreCol = mix(u_c1, vec3(1.0,0.92,0.72), core);
+    col += coreCol * (core * (0.85 + iris*0.35));
+    col += u_c1 * smoothstep(coreR*4.5, 0.0, d) * (0.35 + u_bass*0.5); // bloom halo
+    // rotating targeting ring
+    float ring = smoothstep(0.006, 0.0, abs(d - (coreR*2.2)));
+    col += u_c1 * ring * (0.4 + u_treble);
+
+    // --- cruciform light burst on beat ---
+    float cross = exp(-abs(uv.x)*20.0) + exp(-abs(uv.y)*20.0);
+    col += vec3(1.0,0.88,0.72) * cross * u_beat * 1.3;
+
+    return col;
+  }
+
+  void main(){
+    vec2 uv = (gl_FragCoord.xy - 0.5*u_res) / u_res.y;
+    float t = u_time;
+    // chromatic aberration (stronger on beats)
+    float ca = 0.003 + u_beat*0.012;
+    vec2 dir = normalize(uv + 1e-5);
+    vec3 col;
+    col.r = scene(uv + dir*ca, t).r;
+    col.g = scene(uv,          t).g;
+    col.b = scene(uv - dir*ca, t).b;
+    // neural web on top (computed once, not per CA channel)
+    col += neuralNet(uv, t) * u_net;
+    // CRT scanlines + flicker
+    col *= 0.82 + 0.18*sin(gl_FragCoord.y*2.2);
+    col *= 0.95 + 0.05*sin(t*48.0);
+    // vignette
+    col *= smoothstep(1.45, 0.35, length(uv));
+    col = pow(max(col, 0.0), vec3(0.86));
+    fragColor = vec4(col, 1.0);
+  }`;
+
+  function compile(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  function createRenderer(){
+    gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer:true, antialias:true, alpha:false });
+    if (!gl) throw new Error('WebGL2 not supported in this browser.');
+    prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+    gl.bindAttribLocation(prog, 0, 'a_pos');
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    // fullscreen triangle
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    // uniforms
+    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net'])
+      uni[n] = gl.getUniformLocation(prog, n);
+    // fft texture
+    const bins = analyser ? analyser.frequencyBinCount : 1024;
+    fftTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, fftTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, bins, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(bins));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.uniform1i(uni.u_fft, 0);
+  }
+
+  // ---------------- Analysis helpers ----------------
+  function band(lo,hi){ let s=0,n=0; for(let i=lo;i<hi&&i<freqData.length;i++){s+=freqData[i];n++;} return n? (s/n)/255 : 0; }
+  let bassSmooth=0, beat=0, lastBeat=0, syncSmooth=0;
+  function analyze(now){
+    const g = +gainSlider.value;
+    const bass = Math.min(band(1,18)*g, 1.4);
+    const mid  = Math.min(band(40,180)*g, 1.4);
+    const treb = Math.min(band(300,700)*g, 1.4);
+    bassSmooth = bassSmooth*0.92 + bass*0.08;
+    if (bass > bassSmooth*1.3 && bass > 0.32 && now-lastBeat>170) { beat=1; lastBeat=now; }
+    beat *= 0.90;
+    const energy = (bass*0.6+mid*0.3+treb*0.1);
+    syncSmooth = syncSmooth*0.90 + energy*0.10;
+    return { bass, mid, treb, energy };
+  }
+
+  // ---------------- Neural web (geometry fed to the GPU each frame) ----------------
+  const MAXN = 30, MAXE = 46;
+  const nodeBuf = new Float32Array(MAXN*3);   // x, y, energy
+  const edgeBuf = new Float32Array(MAXE*4);   // x1,y1,x2,y2
+  let netNodes = [], netEdges = [], netOn = true, lastNetT = performance.now();
+  function initNet(){
+    netNodes = [];
+    const N = 26;
+    for (let i=0;i<N;i++){
+      const ring = i < 14;
+      const ang  = ring ? (i/14)*Math.PI*2 : Math.random()*Math.PI*2;
+      const rad  = ring ? 0.86 : Math.random()*0.6;     // logical [-1,1] space
+      netNodes.push({
+        hx: Math.cos(ang)*rad, hy: Math.sin(ang)*rad,
+        x:0, y:0, phase: Math.random()*Math.PI*2,
+        spd: 0.4 + Math.random()*1.5,                   // rapid drift
+        r:   0.02 + Math.random()*0.07,                  // drift radius (uv units)
+        band: 2 + Math.floor(Math.pow(i/N,1.6)*200),
+        e: 0
+      });
+    }
+    // wire each node to its 2 nearest neighbors (by home position), de-duplicated
+    const seen = new Set(); netEdges = [];
+    for (let i=0;i<netNodes.length;i++){
+      const dl = [];
+      for (let j=0;j<netNodes.length;j++) if (j!==i){
+        const dx=netNodes[i].hx-netNodes[j].hx, dy=netNodes[i].hy-netNodes[j].hy;
+        dl.push([dx*dx+dy*dy, j]);
+      }
+      dl.sort((a,b)=>a[0]-b[0]);
+      for (let k=0;k<2;k++){
+        const j = dl[k][1], key = i<j ? i+'-'+j : j+'-'+i;
+        if (!seen.has(key) && netEdges.length<MAXE){ seen.add(key); netEdges.push([i,j]); }
+      }
+    }
+  }
+  initNet();
+  function updateNet(dt, gain){
+    const hw = 0.5*W/H*0.92, hh = 0.5*0.92;   // uv half-extents
+    for (const n of netNodes){
+      n.e = freqData ? Math.min((freqData[n.band]/255)*gain, 1) : 0;
+      n.phase += dt * n.spd * (1 + n.e*1.5 + beat*2.5);
+      const rr = n.r*(1 + n.e*0.9) + beat*0.05;
+      n.x = n.hx*hw + Math.cos(n.phase)*rr;
+      n.y = n.hy*hh + Math.sin(n.phase*1.3)*rr;
+    }
+    for (let i=0;i<MAXN;i++){
+      if (i<netNodes.length){ nodeBuf[i*3]=netNodes[i].x; nodeBuf[i*3+1]=netNodes[i].y; nodeBuf[i*3+2]=netNodes[i].e; }
+      else { nodeBuf[i*3]=99; nodeBuf[i*3+1]=99; nodeBuf[i*3+2]=0; }
+    }
+    for (let i=0;i<MAXE;i++){
+      if (i<netEdges.length){ const [a,b]=netEdges[i];
+        edgeBuf[i*4]=netNodes[a].x; edgeBuf[i*4+1]=netNodes[a].y;
+        edgeBuf[i*4+2]=netNodes[b].x; edgeBuf[i*4+3]=netNodes[b].y;
+      } else { edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99; }
+    }
+  }
+  function applyNet(now){
+    const dt = Math.min((now-lastNetT)/1000, 0.05); lastNetT = now;
+    updateNet(dt, +gainSlider.value);
+    gl.uniform3fv(uni.u_nodes, nodeBuf);
+    gl.uniform4fv(uni.u_edges, edgeBuf);
+    gl.uniform1f(uni.u_net, netOn ? 1 : 0);
+  }
+
+  // ---------------- NERV HUD (2D overlay) ----------------
+  const glyphCols = 40;
+  let scrollY = 0;
+  function drawHUD(a, now){
+    const th = THEMES[+themeSel.value];
+    const amber = th.hud;
+    const s = H/1080;               // scale factor
+    vctx.save();
+    vctx.font = `${Math.round(15*s)}px "Courier New", monospace`;
+    vctx.textBaseline = 'top';
+    vctx.shadowColor = amber; vctx.shadowBlur = 6*s;
+
+    // corner brackets
+    vctx.strokeStyle = amber; vctx.lineWidth = 2*s;
+    const m = 26*s, L = 46*s;
+    bracket(m,m,1,1,L); bracket(W-m,m,-1,1,L); bracket(m,H-m,1,-1,L); bracket(W-m,H-m,-1,-1,L);
+
+    // thin frame
+    vctx.globalAlpha = 0.5; vctx.lineWidth = 1*s;
+    vctx.strokeRect(m,m,W-2*m,H-2*m);
+    vctx.globalAlpha = 1;
+
+    vctx.fillStyle = amber;
+    // top-left block
+    vctx.font = `bold ${Math.round(22*s)}px "Courier New", monospace`;
+    vctx.fillText('NERV', m+14*s, m+12*s);
+    vctx.font = `${Math.round(11*s)}px "Courier New", monospace`;
+    vctx.fillStyle = 'rgba(255,206,158,0.7)';
+    vctx.fillText('MAGI SYSTEM // CASPER-3', m+14*s, m+40*s);
+    vctx.fillText('EMERGENCY MODE : STANDBY', m+14*s, m+56*s);
+
+    // top-right SYNC ratio
+    const sync = Math.min(0.999, syncSmooth*1.4);
+    vctx.textAlign = 'right';
+    vctx.fillStyle = amber;
+    vctx.font = `${Math.round(11*s)}px "Courier New", monospace`;
+    vctx.fillText('SYNC RATIO', W-m-14*s, m+12*s);
+    vctx.font = `bold ${Math.round(30*s)}px "Courier New", monospace`;
+    vctx.fillText(sync.toFixed(3), W-m-14*s, m+26*s);
+    vctx.font = `${Math.round(11*s)}px "Courier New", monospace`;
+    vctx.fillStyle = 'rgba(255,206,158,0.7)';
+    vctx.fillText('HARMONICS NOMINAL', W-m-14*s, m+62*s);
+    vctx.textAlign = 'left';
+
+    // left vertical spectrum bars
+    const bars = 24, bx = m+16*s, bw = 8*s, bh = 5*s, gap = 3*s;
+    const startY = H/2 - (bars*(bh+gap))/2;
+    for (let i=0;i<bars;i++){
+      const idx = Math.floor(Math.pow(i/bars,1.5)*220)+2;
+      const v = Math.min((freqData[idx]/255)* (+gainSlider.value), 1);
+      const lit = Math.round(v*14);
+      for (let j=0;j<14;j++){
+        vctx.globalAlpha = j<lit ? 1 : 0.12;
+        vctx.fillStyle = j>10 ? '#e2231a' : amber;
+        vctx.fillRect(bx + j*(bw+2*s), startY + i*(bh+gap), bw, bh);
+      }
+    }
+    vctx.globalAlpha = 1;
+
+    // right scrolling hex telemetry
+    vctx.fillStyle = 'rgba(255,206,158,0.35)';
+    vctx.font = `${Math.round(11*s)}px "Courier New", monospace`;
+    scrollY = (scrollY + 0.6) % (14*s);
+    const colX = W-m-150*s;
+    for (let r=0;r<18;r++){
+      let str='';
+      for (let c=0;c<10;c++) str += Math.floor(Math.random()*16).toString(16).toUpperCase();
+      vctx.globalAlpha = 0.25 + 0.2*Math.sin(r*0.5+now/400);
+      vctx.fillText(str, colX, H/2 - 120*s + r*14*s + scrollY);
+    }
+    vctx.globalAlpha = 1;
+
+    // bottom-left mission clock
+    vctx.fillStyle = amber;
+    vctx.font = `${Math.round(13*s)}px "Courier New", monospace`;
+    const tc = mediaEl && mediaEl.currentTime ? mediaEl.currentTime : (now/1000);
+    const mm = String(Math.floor(tc/60)).padStart(2,'0');
+    const ss = String(Math.floor(tc%60)).padStart(2,'0');
+    const ff = String(Math.floor((tc%1)*30)).padStart(2,'0');
+    vctx.fillText(`T-${mm}:${ss}:${ff}`, m+14*s, H-m-30*s);
+    vctx.fillStyle='rgba(255,206,158,0.6)';
+    vctx.fillText('BLOOD TYPE: BLUE', m+120*s, H-m-30*s);
+
+    // warning flash on strong beats
+    if (beat > 0.55) {
+      vctx.globalAlpha = Math.min(1, beat);
+      vctx.fillStyle = '#e2231a';
+      vctx.shadowColor = '#e2231a'; vctx.shadowBlur = 16*s;
+      vctx.textAlign = 'center';
+      vctx.font = `bold ${Math.round(34*s)}px "Courier New", monospace`;
+      vctx.fillText('警告  PATTERN BLUE', W/2, H-m-52*s);
+      vctx.font = `${Math.round(13*s)}px "Courier New", monospace`;
+      vctx.fillText('AT-FIELD DETECTED', W/2, H-m-14*s);
+      vctx.textAlign = 'left';
+    }
+    vctx.restore();
+  }
+  function bracket(x,y,sx,sy,L){
+    vctx.beginPath();
+    vctx.moveTo(x, y+sy*L); vctx.lineTo(x, y); vctx.lineTo(x+sx*L, y);
+    vctx.stroke();
+  }
+
+  // ---------------- Main loop ----------------
+  let running=false, startT=performance.now();
+  function loop(now){
+    if (!running) return;
+    requestAnimationFrame(loop);
+    analyser.getByteFrequencyData(freqData);
+    analyser.getByteTimeDomainData(timeData);
+    const a = analyze(now);
+    const th = THEMES[+themeSel.value];
+
+    // upload fft to GPU
+    gl.bindTexture(gl.TEXTURE_2D, fftTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
+    // uniforms
+    gl.uniform2f(uni.u_res, W, H);
+    gl.uniform1f(uni.u_time, (now-startT)/1000);
+    gl.uniform1f(uni.u_bass, a.bass);
+    gl.uniform1f(uni.u_mid, a.mid);
+    gl.uniform1f(uni.u_treble, a.treb);
+    gl.uniform1f(uni.u_beat, beat);
+    gl.uniform3fv(uni.u_c1, th.c1);
+    gl.uniform3fv(uni.u_c2, th.c2);
+    applyNet(now);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // composite: GPU frame -> 2D canvas, then HUD on top
+    vctx.drawImage(glCanvas, 0, 0, W, H);
+    drawHUD(a, now);
+  }
+  function startLoop(){ if (running) return; running=true; startT=performance.now(); requestAnimationFrame(loop); }
+
+  // ---------------- Recording ----------------
+  let recorder=null, chunks=[], recStart=0, recTimer=null;
+  function startRec(){
+    const stream = view.captureStream(60);
+    const tracks = [...stream.getVideoTracks()];
+    if (destNode && destNode.stream.getAudioTracks().length) tracks.push(...destNode.stream.getAudioTracks());
+    const mixed = new MediaStream(tracks);
+    const mime = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
+    try { recorder = new MediaRecorder(mixed, { mimeType:mime, videoBitsPerSecond:14_000_000 }); }
+    catch(e){ recorder = new MediaRecorder(mixed); }
+    chunks=[];
+    recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = saveRec;
+    recorder.start(); recStart=performance.now();
+    recDot.style.display='inline-block'; recBtn.textContent='■ Stop';
+    recTimer=setInterval(()=>{ const s=Math.floor((performance.now()-recStart)/1000); timerEl.textContent=`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; },250);
+    if (mediaEl && mediaEl.paused) play();
+  }
+  function stopRec(){
+    if (recorder && recorder.state!=='inactive') recorder.stop();
+    recDot.style.display='none'; recBtn.textContent='● Rec'; clearInterval(recTimer);
+  }
+  function saveRec(){
+    const blob = new Blob(chunks, {type:'video/webm'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    a.href=url; a.download=`eva-visualizer-${stamp}.webm`; a.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 4000);
+  }
+
+  // ---------------- Events ----------------
+  fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  micBtn.addEventListener('click', useMic);
+  playBtn.addEventListener('click', play);
+  recBtn.addEventListener('click', () => { (recorder && recorder.state==='recording') ? stopRec() : startRec(); });
+  ratioSel.addEventListener('change', resize);
+  netBtn.addEventListener('click', () => {
+    netOn = !netOn;
+    netBtn.classList.toggle('primary', netOn);
+    netBtn.textContent = netOn ? '🧠 Neural' : '🧠 Neural: Off';
+  });
+
+  let seeking=false;
+  seek.addEventListener('input', () => { seeking=true; if (mediaEl&&mediaEl.duration) curTime.textContent=fmt((seek.value/1000)*mediaEl.duration); });
+  function commitSeek(){ if (mediaEl&&mediaEl.duration) mediaEl.currentTime=(seek.value/1000)*mediaEl.duration; seeking=false; }
+  seek.addEventListener('change', commitSeek);
+  seek.addEventListener('pointerup', commitSeek);
+
+  ['dragenter','dragover'].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault()));
+  document.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if (f&&f.type.startsWith('audio')) loadFile(f); });
+  window.addEventListener('resize', resize);
+
+  // ---------------- Boot ----------------
+  try {
+    ensureAudio();          // needed so fft texture width is known
+    resize();
+    createRenderer();
+    // idle preview so it isn't blank before audio loads
+    (function idle(now){
+      if (!running) {
+        now = now || performance.now();
+        gl.uniform2f(uni.u_res, W, H);
+        gl.uniform1f(uni.u_time, now/1000);
+        gl.uniform1f(uni.u_bass, 0.12+0.05*Math.sin(now/700));
+        gl.uniform1f(uni.u_mid, 0.1); gl.uniform1f(uni.u_treble, 0.1);
+        gl.uniform1f(uni.u_beat, 0.0);
+        const th = THEMES[+themeSel.value];
+        gl.uniform3fv(uni.u_c1, th.c1); gl.uniform3fv(uni.u_c2, th.c2);
+        applyNet(now);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        vctx.drawImage(glCanvas, 0, 0, W, H);
+        drawHUD({bass:0,mid:0,treb:0,energy:0}, now);
+        requestAnimationFrame(idle);
+      }
+    })();
+  } catch(err) {
+    document.getElementById('hint').innerHTML =
+      '<div class="big" style="color:#e2231a">WEBGL2 ERROR</div><div class="small">'+err.message+'</div>';
+  }
+})();
+</script>
+</body>
+</html>
