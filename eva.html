@@ -656,18 +656,28 @@
   // over the ones behind it (painter's algorithm). Primitive order within a draw call
   // is well-defined in GLES, so a single instanced call with instance 0 = farthest is
   // enough -- no sorting, no depth test, no blending.
+  // A waterfall is a TIME AXIS: every row is a moment in the song. So each row also
+  // carries the musical state it was captured under (u_row: beat strength, hue step,
+  // energy, bar position) and keeps it forever. Beats and key changes are stamped into
+  // the terrain and then recede into the distance -- the surface becomes a visible
+  // record of the track's rhythm rather than a rolling loudness chart.
   const VERT_WATER = `#version 300 es
   layout(location=0) in vec2 a_v;   // x = 0..1 across the spectrum, y = 0 ridge / 1 skirt
   out float v_mag;                  // this column's magnitude
   out float v_below;                // clip-space distance below the ridge (0 on the line)
   out float v_age;                  // 0 = newest/nearest, 1 = oldest/at the horizon
   out float v_u;
+  out vec4  v_row;                  // (beat, hue, energy, barPos) as captured
   uniform sampler2D u_hist;         // COLS x ROWS spectrum history, row 0 = oldest
+  uniform sampler2D u_row;          // 1 x ROWS per-row musical state, same scroll
   uniform float u_rows, u_amp, u_time, u_bass, u_beat, u_burst, u_safe, u_sway;
+  uniform float u_waveAmp, u_waveK, u_wavePh;
   void main(){
     float row = float(gl_InstanceID);          // 0 first = farthest, so it is overpainted
     float age = 1.0 - row/(u_rows-1.0);        // 0 near .. 1 far
-    float m   = texture(u_hist, vec2(a_v.x, (row+0.5)/u_rows)).r;
+    float ry  = (row+0.5)/u_rows;
+    float m   = texture(u_hist, vec2(a_v.x, ry)).r;
+    vec4  rd  = texture(u_row,  vec2(0.5, ry));
     // perspective: one over depth. Far rows shrink toward the horizon and crowd together.
     float zz = age;
     float sc = 1.0/(1.0 + zz*3.2);
@@ -680,8 +690,15 @@
     float yb = 0.918 - 1.97*sc;
     // relief lifts with the music; the release swells the whole surface
     float h  = m*m * u_amp * sc * (1.0 + u_bass*0.35 + u_burst*0.5*u_safe);
+    // SYNTH WAVE: a travelling oscillation across the surface, phase-locked to the beat
+    // grid (u_wavePh comes from beatPhase), with a second harmonic so the crest has a
+    // waveform shape rather than a plain sine. This is what keeps the terrain alive
+    // through passages where the spectrum itself is a smooth, boring blob.
+    float ph = a_v.x*u_waveK - u_time*1.7 + zz*5.0 + u_wavePh*6.2831;
+    float wv = sin(ph) + 0.35*sin(ph*2.0 + 1.1);
+    h += wv * u_waveAmp * sc * (0.25 + rd.b*1.15);
     float y  = yb + (a_v.y < 0.5 ? h : -2.5);  // the skirt runs well off-frame, always
-    v_mag = m; v_age = age; v_u = a_v.x;
+    v_mag = m; v_age = age; v_u = a_v.x; v_row = rd;
     v_below = (yb + h) - y;                    // 0 on the ridge, grows down the skirt
     gl_Position = vec4(x, y, 0.0, 1.0);
   }`;
@@ -690,23 +707,32 @@
   precision highp float;
   out vec4 fragColor;
   in float v_mag, v_below, v_age, v_u;
+  in vec4  v_row;
   uniform vec3  u_c1, u_c2;
   uniform float u_time, u_beat, u_burst, u_safe, u_exposure, u_treble;
   ${COMMON}
   void main(){
-    float m = v_mag;
+    float m    = v_mag;
+    float rBeat = v_row.r, rEnergy = v_row.b, rBar = v_row.a;
     float fade = (1.0 - v_age*0.72);                  // distance haze
     // the ridge itself: a tight neon line. exp() falloff is FAST on purpose -- a slow
     // one lifts the whole skirt and the terrain reads as a glowing slab.
     float line = exp(-v_below*150.0) + 0.35*exp(-v_below*45.0);
-    vec3 hot   = mix(u_c2, u_c1, clamp(m*1.7, 0.0, 1.0));
-    hot = hueShift(hot, (v_u - 0.5)*0.5 + m*0.2);     // spectrum tints across the frame
+    // Hue comes from the row's OWN stored step, not from the live theme, so the colour
+    // a moment was captured in travels away with it. That is the whole point: you can
+    // see the last few bars of the song laid out behind the current one.
+    float hue = (v_row.g - 0.5)*2.6 + (v_u - 0.5)*0.35;
+    vec3  hot = hueShift(mix(u_c2, u_c1, clamp(m*1.7, 0.0, 1.0)), hue);
     vec3 col = mix(hot, vec3(1.0,0.95,0.86), clamp(m*m*1.3, 0.0, 0.7))
-             * line * (0.30 + m*1.9) * fade;
+             * line * (0.30 + m*1.9 + rEnergy*0.8) * fade;
     // a thin wash immediately under the ridge gives the surface body without a slab
     col += hot * exp(-v_below*10.0) * (0.05 + m*0.10) * fade;
-    // beats run a bright crest along the nearest rows only
-    col += vec3(1.0,0.96,0.88) * line * u_beat*u_beat * 0.55 * u_safe * (1.0 - v_age);
+    // ELECTRIC BEAT SCAR: the row captured on a hit keeps a hot arc-light crest for as
+    // long as it is on screen, so every beat leaves a bright rung receding to the horizon.
+    vec3 spark = mix(vec3(0.55,0.95,1.0), vec3(1.0,0.92,0.70), rBar);
+    col += spark * line * rBeat*rBeat * 1.35 * u_safe * fade;
+    // downbeats (bar starts) get a wider halo so the bar grid reads at a glance
+    col += spark * exp(-v_below*26.0) * rBeat * step(0.75, 1.0-rBar) * 0.30 * u_safe * fade;
     // The skirt must stay essentially BLACK: it is the occluder that makes the whole
     // painter's-algorithm trick work, and anything bright there fills the lower frame.
     fragColor = vec4(col * u_exposure, 1.0);
@@ -1305,6 +1331,15 @@
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, bins, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(bins));
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // per-row musical state. NEAREST on purpose: these are discrete per-row events
+    // (this beat, that key), and filtering would smear one row's beat into its neighbours.
+    rowTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, rowTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, WROWS, 0, gl.RGBA, gl.UNSIGNED_BYTE, rowData);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     buildWaterBins(bins);
@@ -1955,8 +1990,13 @@
   // the whole thing is memmoved down one row per push -- 21 KB at 50 Hz is nothing, and
   // it keeps row 0 = oldest = farthest, which is exactly the order the draw needs.
   const WCOLS = 192, WROWS = 112;
-  let histTex = null, waterVAO = null;
+  let histTex = null, rowTex = null, waterVAO = null;
   const histData = new Uint8Array(WCOLS*WROWS);
+  // Per-row musical state, scrolled in lockstep: (beat strength, hue step, energy,
+  // bar position). 448 bytes, so it is far cheaper to keep as its own 1 x ROWS texture
+  // than to widen histData and memmove four times as much every push.
+  const rowData = new Uint8Array(WROWS*4);
+  let wHue = 0.5, wLastBeat = 0;
   let wBinLo = null, wBinHi = null;      // per-column FFT bin span (log-spaced)
   let wAcc = 0, waterAmp = 0.96;      // matches the slider's 0.8 default via setRelief
   let fluidGain = 1.35;               // "Billow": how much dye the emitters push
@@ -1974,15 +2014,35 @@
       wBinHi[c] = Math.min(top, Math.max(lo+1, 1 + Math.floor(b*(top-2))));
     }
   }
-  function waterPushRow(gain){
+  function waterPushRow(gain, st){
     if (!wBinLo || !freqData) return;
     histData.copyWithin(0, WCOLS);                 // scroll: the oldest row falls off
+    rowData.copyWithin(0, 4);
     const off = (WROWS-1)*WCOLS;
+    let sum = 0;
     for (let c=0;c<WCOLS;c++){
       let mx = 0;
       for (let i=wBinLo[c]; i<wBinHi[c]; i++) if (freqData[i] > mx) mx = freqData[i];
-      histData[off+c] = Math.min(255, mx*gain);
+      const v = Math.min(255, mx*gain);
+      histData[off+c] = v;
+      sum += v;
     }
+    // Hue STEPS on each beat rather than drifting continuously -- a sequencer, not a
+    // fade. Successive beats land on visibly different colours (golden-ratio walk), and
+    // the whole walk is re-centred on the song's key so it stays in one palette family
+    // instead of cycling the rainbow.
+    const b = st.beat;
+    if (b > 0.30 && st.t - wLastBeat > 0.10){
+      wLastBeat = st.t;
+      wHue = (wHue + 0.382*(0.45 + b*0.85)) % 1;
+    }
+    const key = 0.5 + st.harmHue*0.55;             // bounded pull toward the key's hue
+    const hue = 0.5 + ((wHue - 0.5)*0.65 + (key - 0.5)*0.5);
+    const o = (WROWS-1)*4;
+    rowData[o]   = Math.min(255, b*255);
+    rowData[o+1] = Math.max(0, Math.min(255, hue*255));
+    rowData[o+2] = Math.min(255, (sum/WCOLS)*1.6);
+    rowData[o+3] = Math.min(255, st.bar*255);
   }
   // the history is built over time, so a static screenshot needs it pre-filled
   function waterWarm(n){
@@ -1994,7 +2054,12 @@
         const w = 0.55 + 0.45*Math.sin(ph*1.7 + i*0.045)*Math.cos(ph*0.6 + i*0.011);
         freqData[i] = Math.max(0, Math.min(255, base[i]*w));
       }
-      waterPushRow(1.0);
+      // synthesize plausible musical state too, or every row stores the same colour
+      // and the whole point of the per-row metadata is invisible in a render
+      const onBeat = (r % 12) < 2;
+      waterPushRow(1.0, { beat: onBeat ? 0.55 + 0.45*Math.sin(r*0.7) : 0.0,
+                          t: r*0.02, harmHue: Math.sin(r*0.045)*0.5,
+                          bar: ((r/12|0) % 4)/4 });
     }
     freqData.set(base);
   }
@@ -2003,6 +2068,20 @@
   // ---------------- Fluid / smoke (CPU driver) ----------------
   let fVel=[null,null], fDye=[null,null], fPrs=[null,null], fDiv=null, fCurl=null;
   let fV=0, fD=0, fP=0, fW=0, fH=0, fluidOK=false, fluidT=0, fEmit=0;
+  // Hue walks a GOLDEN ANGLE on every beat, so consecutive hits inject maximally
+  // distinct colours and the frame ends up holding several plumes at once that swirl
+  // into each other. A single theme tint is what made this read as a grey-scale
+  // smoke test rather than something reacting to music.
+  let fHue = 0, fLastBeat = -9;
+  // The walk is BOUNDED (sin of the counter), not free. A full-wheel golden-angle walk
+  // makes consecutive plumes maximally distinct -- which is exactly wrong here, because
+  // the dye field is ADDITIVE: maximally distinct hues sum toward white and the smoke
+  // desaturates. Confined to about +/-50 degrees around the theme, overlapping plumes
+  // stay in one family and sum to a brighter version of it instead.
+  function fInk(base, spin, mul){
+    const c = shiftHue(base, Math.sin(fHue*spin)*0.88 + harmHue*1.4);
+    return [c[0]*mul, c[1]*mul, c[2]*mul];
+  }
   const FSIM = 256;                          // sim height; width follows the aspect
   function allocFluid(){
     const asp = (W && H) ? W/H : 9/16;
@@ -2059,6 +2138,10 @@
 
     // ---- inject ----
     fluidT += dt;
+    if (S.beat > 0.30 && fluidT - fLastBeat > 0.10){
+      fLastBeat = fluidT;
+      fHue += 2.399963 * (0.45 + S.beat*0.9);     // golden angle in radians
+    }
     // A standing emitter at the base keeps the frame alive during quiet passages;
     // its strength and colour ride the music.
     fEmit += dt;
@@ -2070,7 +2153,9 @@
       // well, it was the QUIET end that rendered as a near-black frame
       const amp = (0.60 + S.bass*1.15) * fluidGain;
       fV = fSplat(fVel, fV, p, 0.06, (Math.sin(fluidT*0.9))*90, 260*amp, 0, 0.0009);
-      fD = fSplat(fDye, fD, p, 0.06, S.c1[0]*amp*0.55, S.c1[1]*amp*0.55, S.c1[2]*amp*0.55, 0.0011);
+      // the standing column drifts slowly through the walk; hits jump it
+      const ink = fInk(S.c1, 0.35, amp*0.55);
+      fD = fSplat(fDye, fD, p, 0.06, ink[0], ink[1], ink[2], 0.0011);
     }
     // beats fire off-axis bursts; the drop detonates the middle
     if (S.beat > 0.35){
@@ -2080,7 +2165,8 @@
         const px = 0.5 + Math.cos(a)*0.30, py = 0.42 + Math.sin(a)*0.26;
         const k = S.beat*S.beat*260*S.safe;
         fV = fSplat(fVel, fV, px, py, Math.cos(a)*k, Math.sin(a)*k, 0, 0.0016);
-        fD = fSplat(fDye, fD, px, py, S.c2[0]*0.7, S.c2[1]*0.7, S.c2[2]*0.7, 0.0018);
+        const bi = fInk(S.c2, 1.0, 0.55 + S.beat*0.25);
+        fD = fSplat(fDye, fD, px, py, bi[0], bi[1], bi[2], 0.0018);
       }
     }
     if (S.burst > 0.05){
@@ -2089,7 +2175,8 @@
         const a = i/6*Math.PI*2 + fluidT;
         fV = fSplat(fVel, fV, 0.5, 0.45, Math.cos(a)*k, Math.sin(a)*k, 0, 0.004);
       }
-      fD = fSplat(fDye, fD, 0.5, 0.45, S.c1[0]*S.burst, S.c1[1]*S.burst, S.c1[2]*S.burst, 0.006);
+      const ui = fInk(S.c1, 1.0, S.burst*0.7);
+      fD = fSplat(fDye, fD, 0.5, 0.45, ui[0], ui[1], ui[2], 0.006);
     }
     if (mouse.over){
       // cursor drags the smoke around; uv space, y flipped to match the field
@@ -2414,17 +2501,28 @@
     // come back and flush the entire history in one go.
     wAcc = Math.min(wAcc + dt, 0.25);
     const period = 1/50;
-    while (wAcc >= period){ waterPushRow(1.0); wAcc -= period; }
+    const st = { beat: S.beat, t: S.t, harmHue: harmHue, bar: (beatCount + beatPhase)/4 };
+    while (wAcc >= period){ waterPushRow(1.0, st); wAcc -= period; }
 
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, histTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WCOLS, WROWS, gl.RED, gl.UNSIGNED_BYTE, histData);
+    gl.activeTexture(gl.TEXTURE5);
+    gl.bindTexture(gl.TEXTURE_2D, rowTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, WROWS, gl.RGBA, gl.UNSIGNED_BYTE, rowData);
 
     // No blending and no depth test: each ribbon's opaque skirt IS the occluder, and
     // instance 0 (the horizon) is drawn first so nearer rows paint over it.
     gl.useProgram(progWater);
     gl.uniform1i(U(progWater,'u_hist'), 3);
+    gl.uniform1i(U(progWater,'u_row'), 5);
     gl.uniform1f(U(progWater,'u_rows'), WROWS);
+    // The synth wave rides the beat grid, so the surface undulates IN TIME rather than
+    // on its own clock. With no tempo lock yet (bpmConf low) it falls back to a free run
+    // off u_time, which is what the shader's -u_time term already provides.
+    gl.uniform1f(U(progWater,'u_waveAmp'), (0.045 + S.bass*0.075 + S.burst*0.06) * waterAmp);
+    gl.uniform1f(U(progWater,'u_waveK'), 7.0 + S.treb*22.0);
+    gl.uniform1f(U(progWater,'u_wavePh'), bpmConf > 0.25 ? beatPhase : 0.0);
     gl.uniform1f(U(progWater,'u_amp'), waterAmp);
     gl.uniform1f(U(progWater,'u_time'), S.t);
     gl.uniform1f(U(progWater,'u_bass'), S.bass);
