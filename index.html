@@ -3,6 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0b0a0e">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
 <title>Sound Visualizers — react to any track, record, and post</title>
 <meta name="description" content="Free browser-based music visualizers. Load any audio or use your mic, then record a video for your socials. No install, no signup.">
 <style>
@@ -131,5 +137,9 @@
   <footer>
     Built with the Web Audio API + Canvas / WebGL. Open-source. <a href="https://github.com/rabidlego25/visualizer" id="repolink">View source</a>.
   </footer>
+<script>
+  if ('serviceWorker' in navigator)
+    window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(()=>{}));
+</script>
 </body>
 </html>

@@ -1,0 +1,17 @@
+{
+  "name": "Sound Visualizers",
+  "short_name": "Visualizer",
+  "description": "GPU music visualizers that react to any track. Load audio or use your mic, then record a video for your socials.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0a0e",
+  "theme_color": "#0b0a0e",
+  "categories": ["music", "entertainment", "graphics"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -4,6 +4,7 @@ scratchpad/
 *.jpg
 *.jpeg
 *.png
+!icons/*.png
 img/
 inspiration/
 CLAUDE.md
