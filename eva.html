@@ -163,6 +163,17 @@
     </div>
     <div class="sep"></div>
     <div class="group">
+      <label class="field">Clip
+        <select id="clipSel" title="Loop lengths start on a downbeat and run a whole number of bars, so the clip loops seamlessly">
+          <option value="free">Free</option>
+          <option value="bars4">Loop · 4 bars</option>
+          <option value="bars8" selected>Loop · 8 bars</option>
+          <option value="bars16">Loop · 16 bars</option>
+          <option value="s60">Story · 60s</option>
+          <option value="s90">Reel · 90s</option>
+        </select>
+      </label>
+      <button id="safeAreaBtn" title="Show where Instagram's caption and buttons cover a Reel (never recorded)">⌗ Guides</button>
       <button id="recBtn" class="rec" disabled>● Rec</button>
       <span id="recDot"></span>
       <span id="timer">0:00</span>
@@ -194,6 +205,8 @@
   const nodeLbl   = document.getElementById('nodeLbl');
   const ratioSel  = document.getElementById('ratioSel');
   const recBtn    = document.getElementById('recBtn');
+  const clipSel   = document.getElementById('clipSel');
+  const safeAreaBtn = document.getElementById('safeAreaBtn');
   const recDot    = document.getElementById('recDot');
   const timerEl   = document.getElementById('timer');
   const netBtn    = document.getElementById('netBtn');
@@ -2727,6 +2740,40 @@
       vctx.textAlign = 'left';
     }
     vctx.restore();
+    drawSafeArea(s);
+  }
+
+  // Instagram covers the bottom of a Reel with the caption, audio ticker and action
+  // buttons, and the top with its own chrome. Anything composed there is buried, and
+  // you only find out after posting. Meta's published safe area for 1080x1920 is 250px
+  // from the top and 420px from the bottom; sides are a further ~60px.
+  //
+  // Guides are drawn on the VIEW canvas but gated on `!recording`, so they are visible
+  // while composing and can never end up burned into a take.
+  const SAFE = { top: 250/1920, bottom: 420/1920, side: 60/1080 };
+  function drawSafeArea(s){
+    if (!safeArea || recording) return;
+    const x0 = W*SAFE.side, x1 = W - W*SAFE.side;
+    const y0 = H*SAFE.top,  y1 = H - H*SAFE.bottom;
+    vctx.save();
+    // dim what IG will cover, so the readable area is obvious at a glance
+    vctx.fillStyle = 'rgba(0,0,0,0.42)';
+    vctx.fillRect(0, 0, W, y0);
+    vctx.fillRect(0, y1, W, H-y1);
+    vctx.fillRect(0, y0, x0, y1-y0);
+    vctx.fillRect(x1, y0, W-x1, y1-y0);
+    vctx.strokeStyle = 'rgba(90,220,255,0.85)';
+    vctx.lineWidth = Math.max(1, 2*s);
+    vctx.setLineDash([10*s, 8*s]);
+    vctx.strokeRect(x0, y0, x1-x0, y1-y0);
+    vctx.setLineDash([]);
+    vctx.fillStyle = 'rgba(90,220,255,0.95)';
+    vctx.font = `${Math.round(13*s)}px "Courier New", monospace`;
+    vctx.fillText('REELS SAFE AREA', x0 + 8*s, y0 + 6*s);
+    vctx.textAlign = 'center';
+    vctx.fillText('CAPTION / AUDIO / BUTTONS', W/2, y1 + 16*s);
+    vctx.textAlign = 'left';
+    vctx.restore();
   }
   function bracket(x,y,sx,sy,L){
     vctx.beginPath();
@@ -2746,6 +2793,7 @@
     analyser.getByteFrequencyData(freqData);
     analyser.getByteTimeDomainData(timeData);
     const a = analyze(now, dt);
+    recTick();                    // beat-locked cue-in / auto-stop at the clip length
     const S = frameState((now-startT)/1000, a);
     if (modeId === 'web') updateNet(dt, inputGain);
     renderFrame(S, dt);
@@ -2769,6 +2817,7 @@
   const fpCanvas = document.createElement('canvas'); fpCanvas.width = fpCanvas.height = FP_SIZE;
   const fpctx = fpCanvas.getContext('2d');
   let fpMode = false, fpName = '', fpLastAngle = -Math.PI/2, fpBeatPk = 0, fpBurstPk = 0;
+  let safeArea = false;
   function rgbOf(c, s){ return `rgb(${Math.min(255,c[0]*s*255)|0},${Math.min(255,c[1]*s*255)|0},${Math.min(255,c[2]*s*255)|0})`; }
   function fpReset(name){
     fpctx.clearRect(0,0,FP_SIZE,FP_SIZE);
@@ -2828,12 +2877,37 @@
     x.fillText('MAGI // ACOUSTIC FINGERPRINT', 44, FP_SIZE-64);
     x.fillStyle = 'rgba(255,180,90,0.75)'; x.font = '500 20px ui-monospace, monospace';
     x.fillText((fpName||'LIVE INPUT').toUpperCase().slice(0,44), 44, FP_SIZE-34);
-    c.toBlob(b => {
+    // Export at the CURRENT Format, so 9:16 hands back a 1080x1920 image that drops
+    // straight in as a Reel cover. Instagram asks for a cover and most people give it a
+    // random frame; this one is actually a portrait of the specific track.
+    const out = (W !== H) ? coverFrame(c) : c;
+    out.toBlob(b => {
       const url = URL.createObjectURL(b);
       const a = document.createElement('a');
-      a.href = url; a.download = (fpName ? fpName.replace(/\.[^.]+$/,'') : 'song') + '_fingerprint.png';
+      const base = (fpName ? fpName.replace(/\.[^.]+$/,'') : 'song');
+      a.href = url; a.download = base + (out === c ? '_fingerprint.png' : '_cover.png');
       a.click(); setTimeout(()=>URL.revokeObjectURL(url), 4000);
     }, 'image/png');
+  }
+  // place the square fingerprint on a canvas of the current output size, kept inside
+  // the Reels safe area so the title is not buried under Instagram's caption
+  function coverFrame(square){
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const x = c.getContext('2d');
+    x.fillStyle = '#05040a'; x.fillRect(0,0,W,H);
+    const top = H*SAFE.top, bot = H - H*SAFE.bottom;
+    const s = Math.min(W*0.92, (bot-top)*0.92);
+    x.drawImage(square, (W-s)/2, top + (bot-top-s)/2 - H*0.02, s, s);
+    const m = Math.round(Math.min(W,H)*0.05);
+    x.textAlign = 'center';
+    x.fillStyle = '#ffb45a';
+    x.font = `600 ${Math.round(m*0.60)}px ui-monospace, Menlo, monospace`;
+    x.fillText('MAGI // ACOUSTIC FINGERPRINT', W/2, top + m*0.2);
+    x.fillStyle = 'rgba(255,180,90,0.8)';
+    x.font = `500 ${Math.round(m*0.46)}px ui-monospace, monospace`;
+    x.fillText((fpName||'LIVE INPUT').toUpperCase().slice(0,38), W/2, bot - m*0.5);
+    return c;
   }
 
   // ---------------- Recording ----------------
@@ -2841,7 +2915,65 @@
   // read by adaptResolution() and the grain in postProcess() -- a take must not be
   // degraded by the things that keep the LIVE view smooth
   let recording=false;
+  // transient overlay message (tempo warnings and the like), auto-clears
+  let hintFlashT = null;
+  function hintFlash(msg){
+    hint.innerHTML = `<div class="big">${msg}</div>`;
+    hint.classList.remove('hidden');
+    clearTimeout(hintFlashT);
+    hintFlashT = setTimeout(() => hint.classList.add('hidden'), 2200);
+  }
+
+  // ---- clip length: beat-locked loops and platform limits ----
+  // A Reel that loops seamlessly racks up replays, and replays are what the ranking
+  // actually rewards -- but only if the clip is a whole number of BARS and starts on a
+  // downbeat. listen() already tracks tempo and bar position, so this is just wiring.
+  // NOTE this makes the AUDIO loop cleanly; the visuals do not return to a previous
+  // state (the force-directed web and the fluid never do), so the seam is continuity,
+  // not a true cycle.
+  let recArmed = false, recStopAt = 0;
+  function clipBars(){
+    const v = clipSel.value;
+    return v === 'bars4' ? 4 : v === 'bars8' ? 8 : v === 'bars16' ? 16 : 0;
+  }
+  function clipLimit(){
+    const v = clipSel.value;
+    return v === 's60' ? 60 : v === 's90' ? 90 : 0;
+  }
+  // Called every frame while armed: begin exactly on the next downbeat.
+  function recTick(){
+    if (recArmed){
+      // beatPhase wraps 1->0 on each beat and beatCount counts 0..3 within the bar,
+      // so "start of bar" is beatCount 0 with the phase freshly wrapped
+      if (beatCount === 0 && beatPhase < 0.12){
+        recArmed = false;
+        beginRec();
+      }
+      return;
+    }
+    if (recStopAt && recording && performance.now() >= recStopAt) stopRec();
+  }
   function startRec(){
+    const bars = clipBars();
+    // Bar-locked only makes sense once the tempo is actually locked. Below that
+    // confidence the grid is guesswork and the "loop" would not loop -- say so and
+    // record free rather than silently producing a clip that seams badly.
+    if (bars && bpmConf > 0.30 && beatPeriod > 0){
+      recArmed = true;
+      recBtn.textContent = '◴ Cue';
+      recDot.style.display = 'inline-block';
+      timerEl.textContent = 'cue';
+      if (mediaEl && mediaEl.paused) play();
+      return;
+    }
+    if (bars) hintFlash('NO TEMPO LOCK — RECORDING FREE');
+    beginRec();
+  }
+  function beginRec(){
+    const bars = clipBars(), lim = clipLimit();
+    // whole bars at the detected tempo, or the platform's hard ceiling
+    recStopAt = bars && beatPeriod > 0 ? performance.now() + bars*4*beatPeriod*1000
+              : lim ? performance.now() + lim*1000 : 0;
     // lock the internal render back to full size for the take (see adaptResolution)
     recording = true;
     if (renderScale !== 1){ renderScale = 1; allocRTs(W, H); }
@@ -2873,7 +3005,7 @@
   }
   function stopRec(){
     if (recorder && recorder.state!=='inactive') recorder.stop();
-    recording = false;
+    recording = false; recArmed = false; recStopAt = 0;
     recDot.style.display='none'; recBtn.textContent='● Rec'; clearInterval(recTimer);
   }
   function saveRec(){
@@ -2890,7 +3022,10 @@
   fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
   micBtn.addEventListener('click', useMic);
   playBtn.addEventListener('click', play);
-  recBtn.addEventListener('click', () => { (recorder && recorder.state==='recording') ? stopRec() : startRec(); });
+  recBtn.addEventListener('click', () => {
+    if (recArmed){ recArmed=false; recDot.style.display='none'; recBtn.textContent='● Rec'; timerEl.textContent='0:00'; return; }
+    (recorder && recorder.state==='recording') ? stopRec() : startRec();
+  });
   ratioSel.addEventListener('change', resize);
   netBtn.addEventListener('click', () => {
     netOn = !netOn;
@@ -2901,6 +3036,10 @@
   safeBtn.addEventListener('click', () => { safe = !safe; reflectSafe(); });
   fpBtn.addEventListener('click', () => { fpMode = !fpMode; fpBtn.classList.toggle('primary', fpMode); });
   fpSaveBtn.addEventListener('click', fpSave);
+  safeAreaBtn.addEventListener('click', () => {
+    safeArea = !safeArea;
+    safeAreaBtn.classList.toggle('primary', safeArea);
+  });
   // one slider, two meanings: node count for the web, particle density for the nebula
   function applySlider(){
     const v = +nodeSlider.value;
@@ -2983,6 +3122,7 @@
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
       if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
+      if (P.has('guides')) safeArea = tp('guides',0) > 0.5;
       const th = THEMES[Math.max(0, Math.min(THEMES.length-1, tp('theme',0)|0))];
       themeSel.value = String(THEMES.indexOf(th));
       safe  = tp('safe',0) > 0.5;
