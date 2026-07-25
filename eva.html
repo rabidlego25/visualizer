@@ -131,6 +131,8 @@
         <select id="modeSel">
           <option value="web">🧠 Neural Web</option>
           <option value="nebula">✦ Particle Nebula</option>
+          <option value="water">▤ Spectral Waterfall</option>
+          <option value="fluid">≋ Fluid Smoke</option>
         </select>
       </label>
       <label class="field">Unit
@@ -289,6 +291,10 @@
 
   // ---------------- Sizing ----------------
   let W=0, H=0;
+  // short side of the output canvas. Only the ?res= test hook changes it -- the
+  // render harness software-rasterises, and 1080x1920 there costs ~3x for no extra
+  // information, so it renders the identical scene smaller.
+  let baseRes = 1080;
   function resize() {
     const [rw,rh] = ratioSel.value.split(':').map(Number);
     const stage = document.getElementById('stage');
@@ -296,7 +302,11 @@
     let cw=aw, ch=cw*rh/rw;
     if (ch>ah) { ch=ah; cw=ch*rw/rh; }
     view.style.width=cw+'px'; view.style.height=ch+'px';
-    H = 1080; W = Math.round(1080*rw/rh);          // GPU handles full 1080p
+    // 1080 on the SHORT side, so vertical is a true 1080x1920. This used to pin the
+    // height, which made 9:16 only 608 wide -- a third of the pixels Instagram Reels
+    // expects, and its encoder is far harsher on an undersized source than on a big one.
+    if (rw >= rh){ H = baseRes; W = Math.round(baseRes*rw/rh); }
+    else         { W = baseRes; H = Math.round(baseRes*rh/rw); }
     glCanvas.width=W; glCanvas.height=H;
     view.width=W; view.height=H;
     if (gl) allocRTs(Math.round(W*renderScale), Math.round(H*renderScale));
@@ -636,6 +646,185 @@
     fragColor = vec4(col * u_gain * u_ngain, 1.0);
   }`;
 
+  // ---------------- Spectral waterfall ----------------
+  // A scrolling FFT history rendered as a receding terrain: one ribbon per history row,
+  // oldest at the horizon, newest in the foreground.
+  //
+  // OCCLUSION WITHOUT A DEPTH BUFFER: sceneRT has no depth attachment, so each ribbon
+  // is filled from its ridge line all the way DOWN off the bottom of the frame, in
+  // opaque near-black, and the rows are drawn far-to-near. A nearer row simply paints
+  // over the ones behind it (painter's algorithm). Primitive order within a draw call
+  // is well-defined in GLES, so a single instanced call with instance 0 = farthest is
+  // enough -- no sorting, no depth test, no blending.
+  const VERT_WATER = `#version 300 es
+  layout(location=0) in vec2 a_v;   // x = 0..1 across the spectrum, y = 0 ridge / 1 skirt
+  out float v_mag;                  // this column's magnitude
+  out float v_below;                // clip-space distance below the ridge (0 on the line)
+  out float v_age;                  // 0 = newest/nearest, 1 = oldest/at the horizon
+  out float v_u;
+  uniform sampler2D u_hist;         // COLS x ROWS spectrum history, row 0 = oldest
+  uniform float u_rows, u_amp, u_time, u_bass, u_beat, u_burst, u_safe, u_sway;
+  void main(){
+    float row = float(gl_InstanceID);          // 0 first = farthest, so it is overpainted
+    float age = 1.0 - row/(u_rows-1.0);        // 0 near .. 1 far
+    float m   = texture(u_hist, vec2(a_v.x, (row+0.5)/u_rows)).r;
+    // perspective: one over depth. Far rows shrink toward the horizon and crowd together.
+    float zz = age;
+    float sc = 1.0/(1.0 + zz*3.2);
+    // slow camera sway so the terrain is never a flat head-on chart
+    float sway = sin(u_time*0.21)*0.10*u_sway;
+    float x  = ((a_v.x - 0.5) + sway*zz) * 2.15 * sc;
+    // Baseline, solved so the nearest row sits just off the bottom edge (-1.03) and the
+    // horizon lands at +0.45: on a 9:16 canvas a shallower spread leaves the terrain
+    // stranded in a band with dead sky above and below it.
+    float yb = 0.918 - 1.97*sc;
+    // relief lifts with the music; the release swells the whole surface
+    float h  = m*m * u_amp * sc * (1.0 + u_bass*0.35 + u_burst*0.5*u_safe);
+    float y  = yb + (a_v.y < 0.5 ? h : -2.5);  // the skirt runs well off-frame, always
+    v_mag = m; v_age = age; v_u = a_v.x;
+    v_below = (yb + h) - y;                    // 0 on the ridge, grows down the skirt
+    gl_Position = vec4(x, y, 0.0, 1.0);
+  }`;
+
+  const FRAG_WATER = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  in float v_mag, v_below, v_age, v_u;
+  uniform vec3  u_c1, u_c2;
+  uniform float u_time, u_beat, u_burst, u_safe, u_exposure, u_treble;
+  ${COMMON}
+  void main(){
+    float m = v_mag;
+    float fade = (1.0 - v_age*0.72);                  // distance haze
+    // the ridge itself: a tight neon line. exp() falloff is FAST on purpose -- a slow
+    // one lifts the whole skirt and the terrain reads as a glowing slab.
+    float line = exp(-v_below*150.0) + 0.35*exp(-v_below*45.0);
+    vec3 hot   = mix(u_c2, u_c1, clamp(m*1.7, 0.0, 1.0));
+    hot = hueShift(hot, (v_u - 0.5)*0.5 + m*0.2);     // spectrum tints across the frame
+    vec3 col = mix(hot, vec3(1.0,0.95,0.86), clamp(m*m*1.3, 0.0, 0.7))
+             * line * (0.30 + m*1.9) * fade;
+    // a thin wash immediately under the ridge gives the surface body without a slab
+    col += hot * exp(-v_below*10.0) * (0.05 + m*0.10) * fade;
+    // beats run a bright crest along the nearest rows only
+    col += vec3(1.0,0.96,0.88) * line * u_beat*u_beat * 0.55 * u_safe * (1.0 - v_age);
+    // The skirt must stay essentially BLACK: it is the occluder that makes the whole
+    // painter's-algorithm trick work, and anything bright there fills the lower frame.
+    fragColor = vec4(col * u_exposure, 1.0);
+  }`;
+
+  // ---------------- Fluid / smoke (Stable Fluids) ----------------
+  // Jos Stam's scheme, one fragment pass per step, all on textures at a reduced sim
+  // resolution: advect velocity -> curl -> vorticity confinement -> divergence ->
+  // Jacobi pressure solve -> subtract gradient -> advect dye. Music injects "splats"
+  // of velocity and colour; nothing about the field ever comes back to JS.
+  //
+  // Requires HALF_FLOAT render targets. RGBA16F is filterable in core WebGL2, which
+  // matters: semi-Lagrangian advection is a bilinear lookup at a backtraced position,
+  // and with NEAREST it degenerates into blocky garbage.
+  const FLUID_HEAD = `#version 300 es
+  precision highp float;
+  precision highp sampler2D;
+  out vec4 fragColor;
+  uniform vec2 u_texel;                 // 1/simSize
+  vec2 fuv(){ return gl_FragCoord.xy * u_texel; }`;
+
+  // semi-Lagrangian advection: look BACK along the velocity and fetch what was there
+  const FRAG_FADV = `${FLUID_HEAD}
+  uniform sampler2D u_src, u_vel;
+  uniform float u_dt, u_diss;
+  void main(){
+    vec2 uv = fuv();
+    vec2 v  = texture(u_vel, uv).xy;
+    fragColor = texture(u_src, uv - v*u_dt*u_texel) * u_diss;
+  }`;
+
+  const FRAG_FCURL = `${FLUID_HEAD}
+  uniform sampler2D u_vel;
+  void main(){
+    vec2 uv = fuv(), dx = vec2(u_texel.x,0.0), dy = vec2(0.0,u_texel.y);
+    float l = texture(u_vel, uv-dx).y, r = texture(u_vel, uv+dx).y;
+    float b = texture(u_vel, uv-dy).x, t = texture(u_vel, uv+dy).x;
+    fragColor = vec4(0.5*((r-l) - (t-b)), 0.0, 0.0, 1.0);
+  }`;
+
+  // vorticity confinement: push energy back INTO the vortices the grid keeps damping
+  // out. Without it the smoke goes soft and featureless within a couple of seconds.
+  const FRAG_FVORT = `${FLUID_HEAD}
+  uniform sampler2D u_vel, u_curl;
+  uniform float u_dt, u_vort;
+  void main(){
+    vec2 uv = fuv(), dx = vec2(u_texel.x,0.0), dy = vec2(0.0,u_texel.y);
+    float l = texture(u_curl, uv-dx).x, r = texture(u_curl, uv+dx).x;
+    float b = texture(u_curl, uv-dy).x, t = texture(u_curl, uv+dy).x;
+    float c = texture(u_curl, uv).x;
+    vec2 N = 0.5*vec2(abs(r)-abs(l), abs(t)-abs(b));
+    N /= (length(N) + 1e-5);
+    vec2 force = u_vort * c * vec2(N.y, -N.x);
+    fragColor = vec4(texture(u_vel, uv).xy + force*u_dt, 0.0, 1.0);
+  }`;
+
+  const FRAG_FDIV = `${FLUID_HEAD}
+  uniform sampler2D u_vel;
+  void main(){
+    vec2 uv = fuv(), dx = vec2(u_texel.x,0.0), dy = vec2(0.0,u_texel.y);
+    float l = texture(u_vel, uv-dx).x, r = texture(u_vel, uv+dx).x;
+    float b = texture(u_vel, uv-dy).y, t = texture(u_vel, uv+dy).y;
+    fragColor = vec4(0.5*((r-l) + (t-b)), 0.0, 0.0, 1.0);
+  }`;
+
+  const FRAG_FPRESS = `${FLUID_HEAD}
+  uniform sampler2D u_prs, u_div;
+  void main(){
+    vec2 uv = fuv(), dx = vec2(u_texel.x,0.0), dy = vec2(0.0,u_texel.y);
+    float l = texture(u_prs, uv-dx).x, r = texture(u_prs, uv+dx).x;
+    float b = texture(u_prs, uv-dy).x, t = texture(u_prs, uv+dy).x;
+    fragColor = vec4((l+r+b+t - texture(u_div, uv).x) * 0.25, 0.0, 0.0, 1.0);
+  }`;
+
+  // make the field divergence-free again by removing the pressure gradient
+  const FRAG_FGRAD = `${FLUID_HEAD}
+  uniform sampler2D u_vel, u_prs;
+  void main(){
+    vec2 uv = fuv(), dx = vec2(u_texel.x,0.0), dy = vec2(0.0,u_texel.y);
+    float l = texture(u_prs, uv-dx).x, r = texture(u_prs, uv+dx).x;
+    float b = texture(u_prs, uv-dy).x, t = texture(u_prs, uv+dy).x;
+    fragColor = vec4(texture(u_vel, uv).xy - 0.5*vec2(r-l, t-b), 0.0, 1.0);
+  }`;
+
+  // one gaussian blob of velocity or dye, added to whatever is already there
+  const FRAG_FSPLAT = `${FLUID_HEAD}
+  uniform sampler2D u_src;
+  uniform vec2  u_point;
+  uniform vec3  u_value;
+  uniform float u_radius, u_aspect;
+  void main(){
+    vec2 uv = fuv();
+    vec2 d = uv - u_point; d.x *= u_aspect;
+    fragColor = vec4(texture(u_src, uv).xyz + exp(-dot(d,d)/u_radius) * u_value, 1.0);
+  }`;
+
+  // dye -> scene. Shaded off the field so the smoke has form instead of reading flat.
+  const FRAG_FDRAW = `${FLUID_HEAD}
+  uniform sampler2D u_dye;
+  uniform vec2  u_res;
+  uniform float u_time, u_beat, u_burst, u_safe, u_exposure;
+  uniform vec3  u_c1;
+  ${COMMON}
+  void main(){
+    vec2 uv = gl_FragCoord.xy / u_res;
+    vec3 d  = texture(u_dye, uv).rgb;
+    // fake lighting from the dye's own gradient: cheap, and it turns a flat cloud into
+    // something with rolling volume
+    vec2 e = 1.0/u_res;
+    float lum = dot(d, vec3(0.333));
+    float gx = dot(texture(u_dye, uv+vec2(e.x,0)).rgb, vec3(0.333)) - lum;
+    float gy = dot(texture(u_dye, uv+vec2(0,e.y)).rgb, vec3(0.333)) - lum;
+    float shade = clamp(0.5 + (gx*1.6 + gy*2.4)*7.0, 0.25, 1.9);
+    vec3 col = d * shade;
+    col += u_c1 * pow(lum, 3.0) * (0.25 + u_burst*0.5);   // hot cores only
+    fragColor = vec4(col * u_exposure, 1.0);
+  }`;
+
   // ---- nebula backdrop: dark drifting gas the particles hang inside ----
   // Deliberately DIM. Same lesson as the coalesced shapes: the hero (here, the
   // particles) has to dominate, so this is atmosphere and never a subject.
@@ -889,6 +1078,7 @@
   uniform sampler2D u_scene, u_bloom1, u_bloom2;
   uniform vec2  u_res;
   uniform float u_time, u_beat, u_safe, u_bloomAmt, u_ca, u_sat, u_grain;
+  uniform float u_scan, u_scanN;   // scanline amplitude + how many lines tall the frame is
   ${COMMON}
   // ACES filmic curve: rolls highlights off instead of clipping them to white, which
   // is what finally lets the scene be bright WITHOUT blowing out.
@@ -912,7 +1102,12 @@
     col = aces(col);
     col = pow(col, vec3(0.92));                             // small lift back into the mids
 
-    col *= 0.86 + 0.14*sin(gl_FragCoord.y*2.2);             // CRT scanlines
+    // CRT scanlines. The period is expressed in FRAME HEIGHTS, not pixels: it used
+    // to be sin(gl_FragCoord.y*2.2), a 2.86-pixel period, which is essentially Nyquist
+    // at 1080p. Downscaling that (any share/upload re-encode) aliases it into moire,
+    // and because H.264 subsamples chroma 4:2:0, a fine luma pattern comes back as
+    // COLOURED fringing. Coarser, and softened further while recording (u_scan).
+    col *= (1.0 - u_scan) + u_scan*sin(uv.y*u_scanN*6.28318);
     col *= 0.96 + 0.04*sin(u_time*48.0)*u_safe;             // flicker (off in calm mode)
     col *= smoothstep(1.35, 0.28, length(c)*2.0);           // vignette
     col += vec3(1.0) * u_beat * 0.06 * u_safe;              // transient beat pop (gated)
@@ -1006,7 +1201,9 @@
   }
 
   let progWeb=null, progGas=null, progSim=null, progPts=null, progBright=null, progBlur=null, progPost=null;
-  let progTrail=null, progEdge=null, progNode=null;
+  let progTrail=null, progEdge=null, progNode=null, progWater=null;
+  let progFAdv=null, progFCurl=null, progFVort=null, progFDiv=null,
+      progFPress=null, progFGrad=null, progFSplat=null, progFDraw=null;
   // instanced web geometry: a unit quad + a per-instance stream, uploaded each frame
   let edgeVAO=null, nodeVAO=null, edgeInstBuf=null, nodeInstBuf=null;
   let nebulaOK = true;
@@ -1075,6 +1272,31 @@
       new Float32Array([-1,-1, -1,1, 1,-1, 1,1]), 16,
       [[1,4,0]], MAXN*16);                        // i_node(vec4)
 
+    // ---- spectral waterfall: one ribbon strip, re-drawn per history row ----
+    // ridge/skirt vertex pairs marching across the spectrum; the row comes from
+    // gl_InstanceID, so the whole terrain is a single instanced draw.
+    progWater = makeProg(VERT_WATER, FRAG_WATER);
+    const wv = new Float32Array(WCOLS*4);
+    for (let c=0;c<WCOLS;c++){
+      const u = c/(WCOLS-1);
+      wv[c*4]=u; wv[c*4+1]=0; wv[c*4+2]=u; wv[c*4+3]=1;
+    }
+    waterVAO = gl.createVertexArray();
+    gl.bindVertexArray(waterVAO);
+    const wb = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, wb);
+    gl.bufferData(gl.ARRAY_BUFFER, wv, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    histTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, histTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, WCOLS, WROWS, 0, gl.RED, gl.UNSIGNED_BYTE, histData);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
     // fft texture (unit 0 everywhere)
     const bins = analyser ? analyser.frequencyBinCount : 1024;
     fftTex = gl.createTexture();
@@ -1085,6 +1307,24 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    buildWaterBins(bins);
+
+    // Fluid needs filterable float targets (advection is a bilinear fetch at a
+    // backtraced position). Allowed to fail like the nebula: an old device must still
+    // get the other engines rather than a dead page.
+    if (rtFmt.type === gl.HALF_FLOAT){
+      try {
+        progFAdv=makeProg(VERT,FRAG_FADV);     progFCurl=makeProg(VERT,FRAG_FCURL);
+        progFVort=makeProg(VERT,FRAG_FVORT);   progFDiv=makeProg(VERT,FRAG_FDIV);
+        progFPress=makeProg(VERT,FRAG_FPRESS); progFGrad=makeProg(VERT,FRAG_FGRAD);
+        progFSplat=makeProg(VERT,FRAG_FSPLAT); progFDraw=makeProg(VERT,FRAG_FDRAW);
+        fluidOK = true;      // targets are sized lazily, once the canvas aspect is known
+      } catch(e){ fluidOK = false; }
+    }
+    if (!fluidOK){
+      const o = modeSel.querySelector('option[value="fluid"]');
+      if (o) o.remove();
+    }
     // The nebula is built separately and allowed to FAIL: if a device chokes on the
     // particle programs, the web mode still has to come up rather than taking the whole
     // visualizer down with it.
@@ -1175,6 +1415,10 @@
     // every frame, so it eats the bitrate that should be describing the actual image.
     // Back it off while recording; on screen it stays at full strength.
     gl.uniform1f(U(progPost,'u_grain'), recording ? 0.005 : 0.018);
+    // ~3.6px per line at 1080p, and shallower on a take -- high-contrast 1px detail is
+    // the first thing a codec turns into shimmer, and it eats the bitrate too
+    gl.uniform1f(U(progPost,'u_scan'),  recording ? 0.06 : 0.14);
+    gl.uniform1f(U(progPost,'u_scanN'), 300.0);
     drawQuad();
     gl.activeTexture(gl.TEXTURE0);
   }
@@ -1706,6 +1950,224 @@
     figA[0]=shp.a[0]; figA[1]=shp.a[1]; figA[2]=shp.a[2];
     figB[0]=shp.b[0]; figB[1]=shp.b[1]; figB[2]=shp.b[2];
   }
+  // ---------------- Spectral waterfall (CPU side) ----------------
+  // A rolling FFT history. Rather than a ring buffer with index maths in the shader,
+  // the whole thing is memmoved down one row per push -- 21 KB at 50 Hz is nothing, and
+  // it keeps row 0 = oldest = farthest, which is exactly the order the draw needs.
+  const WCOLS = 192, WROWS = 112;
+  let histTex = null, waterVAO = null;
+  const histData = new Uint8Array(WCOLS*WROWS);
+  let wBinLo = null, wBinHi = null;      // per-column FFT bin span (log-spaced)
+  let wAcc = 0, waterAmp = 0.96;      // matches the slider's 0.8 default via setRelief
+  let fluidGain = 1.35;               // "Billow": how much dye the emitters push
+
+  // Columns are spaced by a power curve, not linearly: a linear frequency axis spends
+  // most of the frame on 10-20 kHz, where music has almost nothing, and crushes the
+  // bass and low mids -- where all the visible structure actually is -- into a sliver.
+  function buildWaterBins(bins){
+    wBinLo = new Int32Array(WCOLS); wBinHi = new Int32Array(WCOLS);
+    const top = Math.min(bins, 560);
+    for (let c=0;c<WCOLS;c++){
+      const a = Math.pow(c/WCOLS, 2.1), b = Math.pow((c+1)/WCOLS, 2.1);
+      const lo = 1 + Math.floor(a*(top-2));
+      wBinLo[c] = lo;
+      wBinHi[c] = Math.min(top, Math.max(lo+1, 1 + Math.floor(b*(top-2))));
+    }
+  }
+  function waterPushRow(gain){
+    if (!wBinLo || !freqData) return;
+    histData.copyWithin(0, WCOLS);                 // scroll: the oldest row falls off
+    const off = (WROWS-1)*WCOLS;
+    for (let c=0;c<WCOLS;c++){
+      let mx = 0;
+      for (let i=wBinLo[c]; i<wBinHi[c]; i++) if (freqData[i] > mx) mx = freqData[i];
+      histData[off+c] = Math.min(255, mx*gain);
+    }
+  }
+  // the history is built over time, so a static screenshot needs it pre-filled
+  function waterWarm(n){
+    if (!freqData) return;
+    const base = freqData.slice();
+    for (let r=0;r<n;r++){
+      const ph = r*0.12;
+      for (let i=0;i<freqData.length;i++){
+        const w = 0.55 + 0.45*Math.sin(ph*1.7 + i*0.045)*Math.cos(ph*0.6 + i*0.011);
+        freqData[i] = Math.max(0, Math.min(255, base[i]*w));
+      }
+      waterPushRow(1.0);
+    }
+    freqData.set(base);
+  }
+  function setRelief(v){ waterAmp = 0.20 + v*0.95; }
+
+  // ---------------- Fluid / smoke (CPU driver) ----------------
+  let fVel=[null,null], fDye=[null,null], fPrs=[null,null], fDiv=null, fCurl=null;
+  let fV=0, fD=0, fP=0, fW=0, fH=0, fluidOK=false, fluidT=0, fEmit=0;
+  const FSIM = 256;                          // sim height; width follows the aspect
+  function allocFluid(){
+    const asp = (W && H) ? W/H : 9/16;
+    const h = FSIM, w = Math.max(64, Math.round(FSIM * asp));
+    if (fW === w && fH === h && fVel[0]) return true;
+    for (const rt of [...fVel, ...fDye, ...fPrs, fDiv, fCurl]){
+      if (rt){ gl.deleteTexture(rt.tex); gl.deleteFramebuffer(rt.fb); }
+    }
+    fW = w; fH = h;
+    fVel = [makeRT(w,h), makeRT(w,h)];
+    fDye = [makeRT(w,h), makeRT(w,h)];
+    fPrs = [makeRT(w,h), makeRT(w,h)];
+    fDiv = makeRT(w,h); fCurl = makeRT(w,h);
+    const all = [...fVel, ...fDye, ...fPrs, fDiv, fCurl];
+    if (all.some(rt => !rt)){ fluidOK = false; return false; }
+    for (const rt of all){
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fb);
+      gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return true;
+  }
+  function fBind(rt){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fb);
+    gl.viewport(0, 0, fW, fH);
+  }
+  function fTex(unit, rt, prog, name){
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, rt.tex);
+    gl.uniform1i(U(prog, name), unit);
+  }
+  // add a gaussian blob of `value` into a ping-ponged field at uv `px,py`
+  function fSplat(pair, idx, px, py, vx, vy, vz, radius){
+    const src = pair[idx], dst = pair[1-idx];
+    fBind(dst);
+    gl.useProgram(progFSplat);
+    gl.uniform2f(U(progFSplat,'u_texel'), 1/fW, 1/fH);
+    fTex(4, src, progFSplat, 'u_src');
+    gl.uniform2f(U(progFSplat,'u_point'), px, py);
+    gl.uniform3f(U(progFSplat,'u_value'), vx, vy, vz);
+    gl.uniform1f(U(progFSplat,'u_radius'), radius);
+    gl.uniform1f(U(progFSplat,'u_aspect'), fW/fH);
+    drawQuad();
+    return 1-idx;
+  }
+
+  function simFluid(S, dt){
+    // SECONDS, not frames. Advection backtraces by v*dt*texel, so with dt in frames
+    // (~1.0) a velocity of a few hundred would sweep the field several screen widths
+    // per step and the smoke would just vanish.
+    const d = Math.min(dt, 1/30);
+    const tx = 1/fW, ty = 1/fH;
+    gl.disable(gl.BLEND);
+
+    // ---- inject ----
+    fluidT += dt;
+    // A standing emitter at the base keeps the frame alive during quiet passages;
+    // its strength and colour ride the music.
+    fEmit += dt;
+    if (fEmit > 0.05){
+      fEmit = 0;
+      const sway = Math.sin(fluidT*0.63)*0.22 + Math.sin(fluidT*0.27)*0.12;
+      const p = 0.5 + sway*0.5;
+      // base is deliberately high relative to the slope: the loud end already reads
+      // well, it was the QUIET end that rendered as a near-black frame
+      const amp = (0.60 + S.bass*1.15) * fluidGain;
+      fV = fSplat(fVel, fV, p, 0.06, (Math.sin(fluidT*0.9))*90, 260*amp, 0, 0.0009);
+      fD = fSplat(fDye, fD, p, 0.06, S.c1[0]*amp*0.55, S.c1[1]*amp*0.55, S.c1[2]*amp*0.55, 0.0011);
+    }
+    // beats fire off-axis bursts; the drop detonates the middle
+    if (S.beat > 0.35){
+      const n = S.beat > 0.8 ? 3 : 2;
+      for (let i=0;i<n;i++){
+        const a = (fluidT*2.1 + i*2.4) % (Math.PI*2);
+        const px = 0.5 + Math.cos(a)*0.30, py = 0.42 + Math.sin(a)*0.26;
+        const k = S.beat*S.beat*260*S.safe;
+        fV = fSplat(fVel, fV, px, py, Math.cos(a)*k, Math.sin(a)*k, 0, 0.0016);
+        fD = fSplat(fDye, fD, px, py, S.c2[0]*0.7, S.c2[1]*0.7, S.c2[2]*0.7, 0.0018);
+      }
+    }
+    if (S.burst > 0.05){
+      const k = S.burst*520*S.safe;
+      for (let i=0;i<6;i++){
+        const a = i/6*Math.PI*2 + fluidT;
+        fV = fSplat(fVel, fV, 0.5, 0.45, Math.cos(a)*k, Math.sin(a)*k, 0, 0.004);
+      }
+      fD = fSplat(fDye, fD, 0.5, 0.45, S.c1[0]*S.burst, S.c1[1]*S.burst, S.c1[2]*S.burst, 0.006);
+    }
+    if (mouse.over){
+      // cursor drags the smoke around; uv space, y flipped to match the field
+      const [hw, hh] = webExtent();
+      const px = mouse.x/(hw*2) + 0.5, py = mouse.y/(hh*2) + 0.5;
+      const k = mouse.down ? 420 : 120;
+      fV = fSplat(fVel, fV, px, py, (px-fmx)*k*8, (py-fmy)*k*8, 0, 0.0018);
+      if (mouse.down) fD = fSplat(fDye, fD, px, py, S.c1[0]*0.5, S.c1[1]*0.5, S.c1[2]*0.5, 0.0016);
+      fmx = px; fmy = py;
+    }
+
+    // ---- curl + vorticity confinement ----
+    fBind(fCurl);
+    gl.useProgram(progFCurl);
+    gl.uniform2f(U(progFCurl,'u_texel'), tx, ty);
+    fTex(4, fVel[fV], progFCurl, 'u_vel');
+    drawQuad();
+
+    fBind(fVel[1-fV]);
+    gl.useProgram(progFVort);
+    gl.uniform2f(U(progFVort,'u_texel'), tx, ty);
+    fTex(4, fVel[fV], progFVort, 'u_vel');
+    fTex(5, fCurl,    progFVort, 'u_curl');
+    gl.uniform1f(U(progFVort,'u_dt'), d);
+    gl.uniform1f(U(progFVort,'u_vort'), 26.0 + S.coil*14.0);
+    drawQuad();
+    fV = 1-fV;
+
+    // ---- projection: divergence -> Jacobi -> subtract gradient ----
+    fBind(fDiv);
+    gl.useProgram(progFDiv);
+    gl.uniform2f(U(progFDiv,'u_texel'), tx, ty);
+    fTex(4, fVel[fV], progFDiv, 'u_vel');
+    drawQuad();
+
+    // decay the previous pressure instead of clearing: it is a good initial guess, so
+    // far fewer Jacobi iterations are needed to converge than from zero
+    gl.useProgram(progFPress);
+    gl.uniform2f(U(progFPress,'u_texel'), tx, ty);
+    for (let i=0;i<22;i++){
+      fBind(fPrs[1-fP]);
+      fTex(4, fPrs[fP], progFPress, 'u_prs');
+      fTex(5, fDiv,     progFPress, 'u_div');
+      drawQuad();
+      fP = 1-fP;
+    }
+
+    fBind(fVel[1-fV]);
+    gl.useProgram(progFGrad);
+    gl.uniform2f(U(progFGrad,'u_texel'), tx, ty);
+    fTex(4, fVel[fV], progFGrad, 'u_vel');
+    fTex(5, fPrs[fP], progFGrad, 'u_prs');
+    drawQuad();
+    fV = 1-fV;
+
+    // ---- advect velocity, then dye ----
+    gl.useProgram(progFAdv);
+    gl.uniform2f(U(progFAdv,'u_texel'), tx, ty);
+    gl.uniform1f(U(progFAdv,'u_dt'), d);
+    fBind(fVel[1-fV]);
+    fTex(4, fVel[fV], progFAdv, 'u_src');
+    fTex(5, fVel[fV], progFAdv, 'u_vel');
+    gl.uniform1f(U(progFAdv,'u_diss'), 0.998);
+    drawQuad();
+    fV = 1-fV;
+
+    fBind(fDye[1-fD]);
+    fTex(4, fDye[fD], progFAdv, 'u_src');
+    fTex(5, fVel[fV], progFAdv, 'u_vel');
+    // dye has to fade or the frame saturates to a flat wall of colour within seconds
+    // quiet passages hold their smoke (little turbulence to break it up); loud ones
+    // clear faster so hits stay legible instead of piling into a wall of colour
+    gl.uniform1f(U(progFAdv,'u_diss'), 0.988 - S.bass*0.004 - S.beat*0.006);
+    drawQuad();
+    fD = 1-fD;
+  }
+  let fmx = 0.5, fmy = 0.5;
+
   // ---------------- GPU particle nebula ----------------
   // Positions/velocities live entirely on the GPU and are advanced by transform
   // feedback: the sim vertex shader reads buffer set A and writes buffer set B, then
@@ -1927,12 +2389,85 @@
     gl.bindVertexArray(null);
     gl.disable(gl.BLEND);
   }
+  function drawWaterfall(S, dt){
+    // sky first: the same dim drifting gas the nebula hangs in, used here as the
+    // atmosphere above the horizon (everything below gets painted over by the terrain)
+    bindRT(sceneRT);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progGas);
+    gl.uniform2f(U(progGas,'u_res'), RW, RH);
+    gl.uniform1f(U(progGas,'u_time'), S.t);
+    gl.uniform1f(U(progGas,'u_bass'), S.bass);
+    gl.uniform1f(U(progGas,'u_mid'), S.mid);
+    gl.uniform1f(U(progGas,'u_treble'), S.treb);
+    gl.uniform1f(U(progGas,'u_beat'), S.beat);
+    gl.uniform1f(U(progGas,'u_coil'), S.coil);
+    gl.uniform1f(U(progGas,'u_burst'), S.burst);
+    gl.uniform1f(U(progGas,'u_safe'), S.safe);
+    gl.uniform1f(U(progGas,'u_exposure'), S.expo*0.7);
+    gl.uniform3fv(U(progGas,'u_c1'), S.c1);
+    gl.uniform3fv(U(progGas,'u_c2'), S.c2);
+    drawQuad();
+
+    // Scroll at a FIXED rate rather than one row per frame, or the terrain's speed
+    // becomes a readout of the machine's frame rate. Capped so a stalled tab does not
+    // come back and flush the entire history in one go.
+    wAcc = Math.min(wAcc + dt, 0.25);
+    const period = 1/50;
+    while (wAcc >= period){ waterPushRow(1.0); wAcc -= period; }
+
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, histTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WCOLS, WROWS, gl.RED, gl.UNSIGNED_BYTE, histData);
+
+    // No blending and no depth test: each ribbon's opaque skirt IS the occluder, and
+    // instance 0 (the horizon) is drawn first so nearer rows paint over it.
+    gl.useProgram(progWater);
+    gl.uniform1i(U(progWater,'u_hist'), 3);
+    gl.uniform1f(U(progWater,'u_rows'), WROWS);
+    gl.uniform1f(U(progWater,'u_amp'), waterAmp);
+    gl.uniform1f(U(progWater,'u_time'), S.t);
+    gl.uniform1f(U(progWater,'u_bass'), S.bass);
+    gl.uniform1f(U(progWater,'u_treble'), S.treb);
+    gl.uniform1f(U(progWater,'u_beat'), S.beat);
+    gl.uniform1f(U(progWater,'u_burst'), S.burst);
+    gl.uniform1f(U(progWater,'u_safe'), S.safe);
+    gl.uniform1f(U(progWater,'u_sway'), S.safe);
+    gl.uniform1f(U(progWater,'u_exposure'), S.expo);
+    gl.uniform3fv(U(progWater,'u_c1'), S.c1);
+    gl.uniform3fv(U(progWater,'u_c2'), S.c2);
+    gl.bindVertexArray(waterVAO);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, WCOLS*2, WROWS);
+    gl.bindVertexArray(null);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+  function drawFluid(S, dt){
+    if (!allocFluid()) { drawWeb(S); return; }   // aspect changed / alloc failed
+    simFluid(S, dt);
+    bindRT(sceneRT);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progFDraw);
+    gl.uniform2f(U(progFDraw,'u_texel'), 1/fW, 1/fH);
+    gl.uniform2f(U(progFDraw,'u_res'), RW, RH);
+    fTex(4, fDye[fD], progFDraw, 'u_dye');
+    gl.uniform1f(U(progFDraw,'u_time'), S.t);
+    gl.uniform1f(U(progFDraw,'u_beat'), S.beat);
+    gl.uniform1f(U(progFDraw,'u_burst'), S.burst);
+    gl.uniform1f(U(progFDraw,'u_safe'), S.safe);
+    gl.uniform1f(U(progFDraw,'u_exposure'), S.expo);
+    gl.uniform3fv(U(progFDraw,'u_c1'), S.c1);
+    drawQuad();
+    gl.activeTexture(gl.TEXTURE0);
+  }
   // one frame: upload the spectrum, let the mode draw the scene, then post to canvas
   function renderFrame(S, dt){
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, fftTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
-    if (modeId === 'nebula' && nebulaOK) drawNebula(S, dt); else drawWeb(S);
+    if (modeId === 'nebula' && nebulaOK) drawNebula(S, dt);
+    else if (modeId === 'water') drawWaterfall(S, dt);
+    else if (modeId === 'fluid' && fluidOK) drawFluid(S, dt);
+    else drawWeb(S);
     postProcess(S, trailsOn ? applyTrails(S) : sceneRT);
   }
   // the per-frame state every mode and the post chain reads
@@ -2212,7 +2747,10 @@
     // lock the internal render back to full size for the take (see adaptResolution)
     recording = true;
     if (renderScale !== 1){ renderScale = 1; allocRTs(W, H); }
-    const stream = view.captureStream(60);
+    // 30fps at 1080x1920: a full-size vertical frame is 3x the pixels the old 608x1080
+    // one was, and a phone that cannot hold 60 drops frames into the take (which looks
+    // far worse than 30 ever does). Instagram delivers Reels at 30 regardless.
+    const stream = view.captureStream(W*H >= 1080*1920 ? 30 : 60);
     const tracks = [...stream.getVideoTracks()];
     if (destNode && destNode.stream.getAudioTracks().length) tracks.push(...destNode.stream.getAudioTracks());
     const mixed = new MediaStream(tracks);
@@ -2268,13 +2806,18 @@
   // one slider, two meanings: node count for the web, particle density for the nebula
   function applySlider(){
     const v = +nodeSlider.value;
-    if (modeId === 'nebula') setDensity(v); else setNodeCount(sliderToNodes(v));
+    if (modeId === 'nebula') setDensity(v);
+    else if (modeId === 'water') setRelief(v);
+    else if (modeId === 'fluid') fluidGain = 0.35 + v*1.25;
+    else setNodeCount(sliderToNodes(v));
   }
   nodeSlider.addEventListener('input', applySlider);
   modeSel.addEventListener('change', () => {
     modeId = modeSel.value;
-    nodeLbl.textContent = modeId === 'nebula' ? 'Density' : 'Nodes';
-    netBtn.style.display = modeId === 'nebula' ? 'none' : '';
+    nodeLbl.textContent = modeId === 'nebula' ? 'Density'
+                        : modeId === 'water'  ? 'Relief'
+                        : modeId === 'fluid'  ? 'Billow' : 'Nodes';
+    netBtn.style.display = modeId === 'web' ? '' : 'none';
     clearTrails();                       // don't ghost the mode we just left
     applySlider();
   });
@@ -2341,13 +2884,19 @@
     const P = new URLSearchParams(location.search);
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
+      if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
       const th = THEMES[Math.max(0, Math.min(THEMES.length-1, tp('theme',0)|0))];
       themeSel.value = String(THEMES.indexOf(th));
       safe  = tp('safe',0) > 0.5;
       netOn = tp('net',1) > 0.5;
-      if (P.has('mode')){ modeId = P.get('mode')==='nebula' ? 'nebula' : 'web'; modeSel.value = modeId; }
+      if (P.has('mode')){
+        const m = P.get('mode');
+        modeId = (m==='nebula'||m==='water'||m==='fluid') ? m : 'web';
+        modeSel.value = modeId;
+      }
       if (P.has('trails')) trailsOn = tp('trails',1) > 0.5;
       if (P.has('density')) setDensity(tp('density',0.8));
+      if (P.has('relief'))  setRelief(tp('relief',0.6));
       const bass=tp('bass',0.1), mid=tp('mid',0.1), treb=tp('treb',0.1), bt=tp('beat',0), tf=tp('t',2.0);
       const energy = bass*0.6 + mid*0.3 + treb*0.1;
       const ex = P.has('expo') ? tp('expo',1) : Math.max(0.5, 1.0/(1.0+energy*1.25));
@@ -2401,6 +2950,13 @@
       // only ever shows the random seed scatter, not a settled graph.
       const relaxN = P.has('relax') ? (tp('relax',150)|0) : 150;
       for (let i=0;i<relaxN;i++) updateNet(1/60, 1.0);
+      // the waterfall's terrain IS its history, so an empty one renders a flat plane
+      if (modeId === 'water') waterWarm(P.has('warm') ? (tp('warm',WROWS)|0) : WROWS);
+      // the smoke is built up by the sim, so a cold field screenshots as an empty frame
+      if (modeId === 'fluid' && fluidOK && allocFluid()){
+        const warm = P.has('warm') ? (tp('warm',120)|0) : 120;
+        for (let i=0;i<warm;i++) simFluid({...S, t: tf - (warm-i)*0.016}, 0.016);
+      }
       if (modeId === 'nebula' && nebulaOK){
         // settle the cloud: the sim is iterative, so a single step would only ever
         // screenshot the seed distribution. Warm it up with fixed steps first.
