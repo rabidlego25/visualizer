@@ -28,22 +28,37 @@ TW, TH = 200, 356        # contact-sheet thumb (the frame itself is 9:16)
 # (label, query string). Each is one rendered state.
 # `mode=nebula` adds `warm=` : the particle sim is iterative, so a frame has to be
 # warmed up with fixed steps or it only ever shows the seed distribution.
+# Standard states pin trails=0 so the numbers stay comparable frame to frame; the
+# dedicated "trails" states use &anim= to actually accumulate a wake.
 STATES = [
-    ("web idle / quiet",        "test=1&bass=0.08&mid=0.06&treb=0.05&theme=0&t=2"),
-    ("web bass SPIKE (expo=1)", "test=1&bass=0.95&mid=0.3&treb=0.2&beat=1&expo=1&theme=0&t=2"),
-    ("web bass SETTLED (auto)", "test=1&bass=0.95&mid=0.3&treb=0.2&theme=0&t=2"),
-    ("web treble / cyan",       "test=1&bass=0.2&mid=0.4&treb=0.9&theme=2&t=2"),
-    ("web TESTIFY loud+beat",   "test=1&bass=0.7&mid=0.6&treb=0.4&beat=1&theme=4&t=2"),
-    ("web CALM loud+beat",      "test=1&bass=0.95&mid=0.5&treb=0.3&beat=1&safe=1&theme=0&t=2"),
-    ("neb idle / quiet",        "test=1&mode=nebula&bass=0.10&mid=0.08&treb=0.06&theme=0&t=4&warm=200"),
-    ("neb mid groove",          "test=1&mode=nebula&bass=0.55&mid=0.45&treb=0.30&beat=0.5&theme=2&t=4&warm=200"),
-    ("neb TESTIFY loud+beat",   "test=1&mode=nebula&bass=0.85&mid=0.6&treb=0.5&beat=1&theme=4&t=4&warm=200"),
-    ("neb COILED (build)",      "test=1&mode=nebula&bass=0.6&mid=0.5&treb=0.6&coil=0.9&theme=1&t=4&warm=200"),
-    ("neb BURST (drop)",        "test=1&mode=nebula&bass=0.9&mid=0.6&treb=0.4&beat=1&burst=1.2&theme=3&t=4&warm=200"),
-    ("neb CALM loud+beat",      "test=1&mode=nebula&bass=0.9&mid=0.5&treb=0.3&beat=1&safe=1&theme=0&t=4&warm=200"),
+    ("web idle / quiet",        "test=1&trails=0&bass=0.08&mid=0.06&treb=0.05&theme=0&t=2"),
+    ("web bass SPIKE (expo=1)", "test=1&trails=0&bass=0.95&mid=0.3&treb=0.2&beat=1&expo=1&theme=0&t=2"),
+    ("web bass SETTLED (auto)", "test=1&trails=0&bass=0.95&mid=0.3&treb=0.2&theme=0&t=2"),
+    ("web treble / cyan",       "test=1&trails=0&bass=0.2&mid=0.4&treb=0.9&theme=2&t=2"),
+    ("web TESTIFY loud+beat",   "test=1&trails=0&bass=0.7&mid=0.6&treb=0.4&beat=1&theme=4&t=2"),
+    ("web CALM loud+beat",      "test=1&trails=0&bass=0.95&mid=0.5&treb=0.3&beat=1&safe=1&theme=0&t=2"),
+    ("web TRAILS (anim)",       "test=1&trails=1&anim=45&bass=0.6&mid=0.5&treb=0.4&beat=0.7&theme=4&t=2"),
+    # The geometry rewrite is only worth anything if the count actually scales, so
+    # bracket it: a sparse graph and one an order of magnitude past the old 48 cap.
+    # These deliberately run a QUIET background -- at high mid the AT-field hex grid
+    # outshines the web entirely and both frames look identical regardless of count.
+    ("web 24 nodes",            "test=1&trails=0&nodes=24&bass=0.12&mid=0.10&treb=0.08&theme=0&t=2"),
+    ("web 400 nodes",           "test=1&trails=0&nodes=400&bass=0.12&mid=0.10&treb=0.08&theme=0&t=2"),
+    ("neb idle / quiet",        "test=1&trails=0&mode=nebula&bass=0.10&mid=0.08&treb=0.06&theme=0&t=4&warm=200"),
+    ("neb mid groove",          "test=1&trails=0&mode=nebula&bass=0.55&mid=0.45&treb=0.30&beat=0.5&theme=2&t=4&warm=200"),
+    ("neb TESTIFY loud+beat",   "test=1&trails=0&mode=nebula&bass=0.85&mid=0.6&treb=0.5&beat=1&theme=4&t=4&warm=200"),
+    ("neb COILED (build)",      "test=1&trails=0&mode=nebula&bass=0.6&mid=0.5&treb=0.6&coil=0.9&theme=1&t=4&warm=200"),
+    ("neb BURST (drop)",        "test=1&trails=0&mode=nebula&bass=0.9&mid=0.6&treb=0.4&beat=1&burst=1.2&theme=3&t=4&warm=200"),
+    ("neb CALM loud+beat",      "test=1&trails=0&mode=nebula&bass=0.9&mid=0.5&treb=0.3&beat=1&safe=1&theme=0&t=4&warm=200"),
+    ("neb TRAILS (anim)",       "test=1&trails=1&anim=45&mode=nebula&bass=0.7&mid=0.5&treb=0.4&beat=0.8&theme=2&t=4&warm=150"),
 ]
 
 def render(query, png):
+    # Delete first. A failed/timed-out render leaves the PREVIOUS run's file in place,
+    # and measure() would happily report it as the current one -- stale numbers that
+    # look plausible are far worse than a loud RENDER FAILED.
+    if os.path.exists(png):
+        os.remove(png)
     with tempfile.TemporaryDirectory() as prof:
         try:
             subprocess.run([
@@ -55,9 +70,12 @@ def render(query, png):
                 "--disable-features=Translate,MediaRouter,OptimizationHints,WebAppInstallation",
                 "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
                 "--run-all-compositor-stages-before-draw",  # avoid blank/early captures
-                f"--window-size={W},{H}", "--virtual-time-budget=3000",
+                f"--window-size={W},{H}", "--virtual-time-budget=6000",
                 f"--screenshot={png}", f"{EVA}?{query}",
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            # 240s, not 60: the web is instanced geometry now, and software
+            # rasterising ~5x overdraw of translucent quads is slow in a way a
+            # real GPU never will be. A too-short timeout just yields black frames.
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
         except subprocess.TimeoutExpired:
             pass  # non-fatal: leave png missing, caller reports RENDER FAILED
 

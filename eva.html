@@ -151,6 +151,7 @@
       </label>
       <button id="netBtn" class="primary">🧠 Neural</button>
       <label class="field"><span id="nodeLbl">Nodes</span> <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.8"></label>
+      <button id="trailBtn" class="primary" title="Feedback trails — motion leaves a fading wake">✳ Trails</button>
       <button id="safeBtn" title="Reduce flashing & motion">🕊 Calm</button>
     </div>
     <div class="sep"></div>
@@ -195,6 +196,7 @@
   const timerEl   = document.getElementById('timer');
   const netBtn    = document.getElementById('netBtn');
   const safeBtn   = document.getElementById('safeBtn');
+  const trailBtn  = document.getElementById('trailBtn');
   const nodeSlider= document.getElementById('nodeSlider');
   const fpBtn     = document.getElementById('fpBtn');
   const fpSaveBtn = document.getElementById('fpSaveBtn');
@@ -347,11 +349,10 @@
   uniform vec3  u_c2;      // base edge color
   uniform sampler2D u_fft; // 1D-ish frequency texture
 
-  const int MAXN = 48;     // neural nodes (hard cap of the uniform array)
-  const int MAXE = 96;     // neural edges
-  uniform vec3  u_nodes[MAXN];  // xy = position (uv space), z = energy 0..1
-  uniform vec4  u_edges[MAXE];  // (x1,y1) -> (x2,y2); padded entries use x>90
-  uniform float u_net;          // neural-net master intensity 0..1
+  // NOTE: the neural web is no longer drawn here. It used to be two per-pixel loops
+  // over uniform arrays (MAXE edges + MAXN nodes for EVERY fragment), which is what
+  // pinned the node ceiling at 48. It is now real geometry -- see FRAG_EDGE/FRAG_NODE,
+  // drawn additively over this background by drawNet().
   uniform float u_exposure;     // auto-exposure: <1 during sustained-loud passages
   uniform float u_safe;         // 1 = full effects, low = reduced motion/flashing
   uniform float u_coh;          // 0..1 coalescence: background quiets so the figure reads
@@ -392,55 +393,6 @@
     float h = clamp(dot(pa,ba)/(dot(ba,ba)+1e-5), 0.0, 1.0);
     return length(pa - ba*h);
   }
-  // MAGI neural web: glowing synapse lines with data packets racing along them
-  vec3 neuralNet(vec2 uv, float t){
-    vec3 col = vec3(0.0);
-    vec3 lineCol = mix(u_c1, vec3(1.0), 0.35);
-    for (int i=0;i<MAXE;i++){
-      vec4 e = u_edges[i];
-      if (e.x > 90.0) continue;                       // padded / inactive edge
-      float d = segDist(uv, e.xy, e.zw);
-      col += lineCol * smoothstep(0.006,0.0,d) * 0.22; // soft synapse
-      col += lineCol * smoothstep(0.0016,0.0,d) * 0.6; // bright core
-      // fast-moving data packets (multiple per edge, speed surges on beats)
-      float seed = fract(sin(float(i)*13.19)*43758.5453);
-      for (int k=0;k<2;k++){
-        float sp  = 0.7 + seed*1.1 + u_beat*1.8*u_safe;
-        float pos = fract(t*sp + seed + float(k)*0.5);
-        float pd  = length(uv - mix(e.xy, e.zw, pos));
-        col += vec3(1.0,0.96,0.86) * smoothstep(0.013,0.0,pd) * (0.85 + u_beat);
-      }
-    }
-    for (int i=0;i<MAXN;i++){
-      vec3 n = u_nodes[i];
-      if (n.x > 90.0) continue;
-      float nd = length(uv - n.xy);
-      float en = n.z;                                    // energy (incl. flicker spark)
-      // core dot: pops bigger & brighter with energy + beat ("jump")
-      float coreSz = 0.016 + en*0.03 + u_beat*0.012*u_safe;
-      col += mix(u_c2, u_c1, en) * smoothstep(coreSz, 0.0, nd) * (0.5 + en*2.2);
-      col += u_c1 * smoothstep(0.07, 0.0, nd) * en * 0.5;  // node halo
-      // per-node "gas": a small cloud of drifting sparks + a soft nebula that
-      // breathes with the node's energy. near-field gate keeps it cheap.
-      if (nd < 0.16){
-        float seed = fract(sin(float(i)*7.31)*43758.5453);
-        float hz = 0.0;
-        for (int k=0;k<4;k++){
-          float fk = float(k);
-          float a  = seed*6.2831 + fk*1.9 + t*(0.6 + seed*1.4) + sin(t*1.7 + fk)*0.6;
-          float rad = (0.02 + en*0.06 + u_beat*0.02*u_safe) * (0.5 + fk*0.4);
-          float pd = length(uv - (n.xy + vec2(cos(a), sin(a))*rad));
-          hz += smoothstep(0.012, 0.0, pd);
-        }
-        vec3 gasCol = mix(u_c1, vec3(1.0,0.95,0.85), 0.4);
-        col += gasCol * hz * (0.25 + en*1.5);
-        float haze = smoothstep(0.14, 0.0, nd) - smoothstep(0.05, 0.0, nd);
-        col += mix(u_c2, u_c1, en) * haze * en * 0.6;      // nebular puff
-      }
-    }
-    return col;
-  }
-
   // signed distance to the closed figure polygon (negative = inside). Winding
   // test (iq) gives a solid fillable silhouette regardless of node count.
   float figSDF(vec2 p){
@@ -556,11 +508,132 @@
     // neural web stays readable: dims far less than the background (0.7 -> ~30% of the dimming)
     // ...but as the figure coalesces the web RECEDES so the solid silhouette dominates
     // (fixes the old "sync high = unreadable bright blob").
-    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.5) * (1.0 - u_coh*0.30);
-    net *= (1.0 + u_coil*0.18 + u_burst*0.30);         // tension glows; release flashes (restrained)
     vec3 fig = figure(uv, t);
-    // HDR out: the grade (bloom, tonemap, scanlines, vignette) lives in the post pass
-    fragColor = vec4(scn + net + fig, 1.0);
+    // HDR out: the grade (bloom, tonemap, scanlines, vignette) lives in the post pass.
+    // The neural web is additively drawn OVER this by the edge/node geometry passes.
+    fragColor = vec4(scn + fig, 1.0);
+  }`;
+
+  // ---------------- Neural web as GEOMETRY ----------------
+  // Edges are instanced quads and nodes are instanced sprites, so cost scales with the
+  // number of primitives instead of pixels*primitives. That is what lifts the ceiling
+  // from 48 nodes to several hundred.
+  //
+  // Both passes must land exactly where the background shader thinks they are, so they
+  // reproduce the INVERSE of the beat "punch" that FRAG_WEB's main() applies to uv.
+  const WEB_XF = `
+  uniform vec2  u_res;
+  uniform float u_time, u_beat, u_burst, u_coil, u_safe;
+  vec2 webToClip(vec2 p){
+    float punch = 1.0 + (u_beat*0.15 + u_burst*0.06 + u_coil*0.04)*u_safe;
+    float rk    = u_beat*0.055*u_safe;
+    vec2  shake = vec2(sin(u_time*133.0), cos(u_time*149.0)) * (u_beat*u_beat*0.012) * u_safe;
+    vec2 q = p - shake;
+    q = mat2(cos(rk), sin(rk), -sin(rk), cos(rk)) * q;   // transpose = inverse rotation
+    q *= punch;
+    return vec2(q.x * 2.0 * u_res.y / u_res.x, q.y * 2.0);
+  }`;
+
+  // ---- edges: one instanced quad per synapse, oriented along the segment ----
+  const VERT_EDGE = `#version 300 es
+  layout(location=0) in vec2 a_corner;   // unit quad: x = along 0..1, y = across -1..1
+  layout(location=1) in vec4 i_seg;      // (ax, ay, bx, by) in web space
+  layout(location=2) in vec2 i_meta;     // (energy 0..1, seed 0..1)
+  out vec2 v_p, v_a, v_b;
+  out vec2 v_meta;
+  uniform float u_wide;                  // half-width of the quad (must cover the glow)
+  ${WEB_XF}
+  void main(){
+    vec2 a = i_seg.xy, b = i_seg.zw;
+    vec2 d = b - a;
+    float L = length(d) + 1e-6;
+    vec2 dir = d / L, perp = vec2(-dir.y, dir.x);
+    // extend past both caps so packets riding the ends are not clipped by the quad
+    vec2 p = mix(a, b, a_corner.x) + dir*(a_corner.x*2.0 - 1.0)*u_wide + perp*a_corner.y*u_wide;
+    v_p = p; v_a = a; v_b = b; v_meta = i_meta;
+    gl_Position = vec4(webToClip(p), 0.0, 1.0);
+  }`;
+
+  const FRAG_EDGE = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  in vec2 v_p, v_a, v_b;
+  in vec2 v_meta;
+  uniform vec3  u_c1;
+  uniform float u_gain;    // master web intensity (exposure, coalescence, tension)
+  uniform float u_scale;   // feature size, shrinks as the node count grows
+  ${WEB_XF}
+  float segDist(vec2 p, vec2 a, vec2 b){
+    vec2 pa = p-a, ba = b-a;
+    float h = clamp(dot(pa,ba)/(dot(ba,ba)+1e-5), 0.0, 1.0);
+    return length(pa - ba*h);
+  }
+  void main(){
+    float d = segDist(v_p, v_a, v_b);
+    float seed = v_meta.y, en = v_meta.x;
+    vec3 lineCol = mix(u_c1, vec3(1.0), 0.35);
+    vec3 col = lineCol * smoothstep(0.006*u_scale, 0.0, d) * 0.22;  // soft synapse
+    col += lineCol * smoothstep(0.0016*u_scale, 0.0, d) * 0.6;      // bright core
+    // fast-moving data packets (two per edge, speed surges on beats)
+    for (int k=0;k<2;k++){
+      float sp  = 0.7 + seed*1.1 + u_beat*1.8*u_safe;
+      float pos = fract(u_time*sp + seed + float(k)*0.5);
+      float pd  = length(v_p - mix(v_a, v_b, pos));
+      col += vec3(1.0,0.96,0.86) * smoothstep(0.013*u_scale, 0.0, pd) * (0.85 + u_beat);
+    }
+    fragColor = vec4(col * u_gain * (0.7 + en*0.5), 1.0);
+  }`;
+
+  // ---- nodes: one instanced quad per node (core dot + halo + drifting gas) ----
+  const VERT_NODE = `#version 300 es
+  layout(location=0) in vec2 a_corner;   // unit quad in -1..1
+  layout(location=1) in vec4 i_node;     // (x, y, energy, seed)
+  out vec2 v_local;                      // offset from the node centre, in web units
+  out vec2 v_meta;
+  uniform float u_rad;                   // quad half-size (covers halo + gas)
+  ${WEB_XF}
+  void main(){
+    vec2 off = a_corner * u_rad;
+    v_local = off;
+    v_meta  = vec2(i_node.z, i_node.w);
+    gl_Position = vec4(webToClip(i_node.xy + off), 0.0, 1.0);
+  }`;
+
+  const FRAG_NODE = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  in vec2 v_local;
+  in vec2 v_meta;
+  uniform vec3  u_c1, u_c2;
+  uniform float u_gain;
+  uniform float u_scale;   // feature size, shrinks as the node count grows
+  uniform float u_ngain;   // per-node brightness, also falls with count (additive pile-up)
+  uniform float u_rad;     // the quad's own half-size: nothing may be drawn outside it
+  ${WEB_XF}
+  void main(){
+    float nd = length(v_local);
+    float en = v_meta.x, seed = v_meta.y;
+    // core dot: pops bigger & brighter with energy + beat ("jump")
+    float coreSz = (0.016 + en*0.03 + u_beat*0.012*u_safe) * u_scale;
+    vec3 col = mix(u_c2, u_c1, en) * smoothstep(coreSz, 0.0, nd) * (0.5 + en*2.2);
+    col += u_c1 * smoothstep(0.07*u_scale, 0.0, nd) * en * 0.5;    // node halo
+    // per-node "gas": a small cloud of drifting sparks + a soft nebula that
+    // breathes with the node's energy.
+    float hz = 0.0;
+    for (int k=0;k<4;k++){
+      float fk = float(k);
+      float a  = seed*6.2831 + fk*1.9 + u_time*(0.6 + seed*1.4) + sin(u_time*1.7 + fk)*0.6;
+      // the outer spark ring grows with energy and would otherwise be sliced off by
+      // the quad edge on a loud beat -- keep it inside the sprite it is drawn in
+      float rad = min((0.02 + en*0.06 + u_beat*0.02*u_safe) * (0.5 + fk*0.4) * u_scale,
+                      u_rad*0.90);
+      float pd = length(v_local - vec2(cos(a), sin(a))*rad);
+      hz += smoothstep(0.012*u_scale, 0.0, pd);
+    }
+    col += mix(u_c1, vec3(1.0,0.95,0.85), 0.4) * hz * (0.25 + en*1.5);
+    float haze = smoothstep(0.14*u_scale, 0.0, nd) - smoothstep(0.05*u_scale, 0.0, nd);
+    col += mix(u_c2, u_c1, en) * haze * en * 0.6;                  // nebular puff
+    fragColor = vec4(col * u_gain * u_ngain, 1.0);
   }`;
 
   // ---- nebula backdrop: dark drifting gas the particles hang inside ----
@@ -784,12 +857,38 @@
     c += (texture(u_src, uv+o2).rgb + texture(u_src, uv-o2).rgb) * 0.0702702703;
     fragColor = vec4(c, 1.0);
   }`;
+  // ---- feedback trails: the previous frame, warped, kept alongside the new one ----
+  // Combined with max(), NOT a sum. An additive feedback loop reaches a steady state of
+  // scene/(1-decay) -- at decay 0.86 that is 7x the source, i.e. an instant white-out.
+  // max() gives comet tails that can never exceed the brightness of what cast them.
+  const FRAG_TRAIL = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  uniform sampler2D u_scene, u_prev;
+  uniform vec2  u_res;
+  uniform float u_decay, u_zoom, u_rot, u_hue;
+  ${COMMON}
+  void main(){
+    vec2 uv = gl_FragCoord.xy / u_res;
+    vec2 c  = uv - 0.5;
+    float asp = u_res.x / u_res.y;
+    // rotate/scale about centre in ASPECT-CORRECTED space, or the swirl goes oval.
+    // u_zoom < 1 samples inward, so the history streams outward as it fades.
+    vec2 p = vec2(c.x*asp, c.y);
+    float ca = cos(u_rot), sa = sin(u_rot);
+    p = mat2(ca, -sa, sa, ca) * p * u_zoom;
+    vec2 q = vec2(p.x/asp, p.y) + 0.5;
+    vec3 prev = texture(u_prev, q).rgb * u_decay;
+    prev = hueShift(prev, u_hue);                 // trails drift in hue as they age
+    fragColor = vec4(max(texture(u_scene, uv).rgb, prev), 1.0);
+  }`;
+
   const FRAG_POST = `#version 300 es
   precision highp float;
   out vec4 fragColor;
   uniform sampler2D u_scene, u_bloom1, u_bloom2;
   uniform vec2  u_res;
-  uniform float u_time, u_beat, u_safe, u_bloomAmt, u_ca, u_sat;
+  uniform float u_time, u_beat, u_safe, u_bloomAmt, u_ca, u_sat, u_grain;
   ${COMMON}
   // ACES filmic curve: rolls highlights off instead of clipping them to white, which
   // is what finally lets the scene be bright WITHOUT blowing out.
@@ -817,7 +916,7 @@
     col *= 0.96 + 0.04*sin(u_time*48.0)*u_safe;             // flicker (off in calm mode)
     col *= smoothstep(1.35, 0.28, length(c)*2.0);           // vignette
     col += vec3(1.0) * u_beat * 0.06 * u_safe;              // transient beat pop (gated)
-    col += (h21(uv*u_res + fract(u_time)*311.0) - 0.5) * 0.018;   // grain: hides 8-bit banding
+    col += (h21(uv*u_res + fract(u_time)*311.0) - 0.5) * u_grain;  // grain: hides 8-bit banding
     fragColor = vec4(max(col, 0.0), 1.0);
   }`;
 
@@ -839,7 +938,8 @@
 
   // ---- render targets ----
   let rtFmt = null, bloomThr = 1.0;       // {internal, type} chosen at init
-  let sceneRT = null, bloom1 = [null,null], bloom2 = [null,null];
+  let sceneRT = null, bloom1 = [null,null], bloom2 = [null,null], trailRT = [null,null];
+  let trailCur = 0, trailsOn = true;
   let RW = 0, RH = 0;                     // current internal render size
   function makeRT(w, h){
     const tex = gl.createTexture();
@@ -861,11 +961,25 @@
     if (RW === w && RH === h && sceneRT) return;
     RW = w; RH = h;
     freeRT(sceneRT); for (const b of bloom1) freeRT(b); for (const b of bloom2) freeRT(b);
+    for (const t of trailRT) freeRT(t);
     const hw = Math.max(2, w>>1), hh = Math.max(2, h>>1);
     const qw = Math.max(2, w>>2), qh = Math.max(2, h>>2);
     sceneRT  = makeRT(w, h);
     bloom1[0] = makeRT(hw, hh); bloom1[1] = makeRT(hw, hh);
     bloom2[0] = makeRT(qw, qh); bloom2[1] = makeRT(qw, qh);
+    trailRT[0] = makeRT(w, h); trailRT[1] = makeRT(w, h);
+    clearTrails();
+  }
+  // wipe the feedback history: fresh targets hold garbage, and a mode switch would
+  // otherwise ghost the previous visual for a second
+  function clearTrails(){
+    if (!trailRT[0] || !trailRT[1]) return;
+    for (const t of trailRT){
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
+      gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    trailCur = 0;
   }
   // adaptive resolution: the internal render size tracks the measured frame time so a
   // phone degrades gracefully instead of dropping to a slideshow. The HUD and the
@@ -873,6 +987,10 @@
   let renderScale = 1, frameMs = 16.7, scaleFrames = 0;
   function adaptResolution(dt){
     frameMs = frameMs*0.9 + Math.min(dt, 100)*0.1;
+    // NEVER downscale while recording. Capturing at 60fps drives frame times up, which
+    // would make the scaler shrink the render and hand the encoder an upscaled, soft
+    // image -- the export would look worse than the live view for no reason.
+    if (recording) return;
     if (++scaleFrames < 45) return;
     scaleFrames = 0;
     const before = renderScale;
@@ -888,6 +1006,9 @@
   }
 
   let progWeb=null, progGas=null, progSim=null, progPts=null, progBright=null, progBlur=null, progPost=null;
+  let progTrail=null, progEdge=null, progNode=null;
+  // instanced web geometry: a unit quad + a per-instance stream, uploaded each frame
+  let edgeVAO=null, nodeVAO=null, edgeInstBuf=null, nodeInstBuf=null;
   let nebulaOK = true;
   function createRenderer(){
     gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer:true, antialias:false, alpha:false });
@@ -907,8 +1028,11 @@
     bloomThr = (rtFmt.type === gl.HALF_FLOAT) ? 1.0 : 0.72;
 
     progWeb    = makeProg(VERT, FRAG_WEB);
+    progEdge   = makeProg(VERT_EDGE, FRAG_EDGE);
+    progNode   = makeProg(VERT_NODE, FRAG_NODE);
     progBright = makeProg(VERT, FRAG_BRIGHT);
     progBlur   = makeProg(VERT, FRAG_BLUR);
+    progTrail  = makeProg(VERT, FRAG_TRAIL);
     progPost   = makeProg(VERT, FRAG_POST);
 
     // fullscreen triangle (its own VAO, so particle attribute state never leaks in)
@@ -920,6 +1044,36 @@
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
+
+    // ---- instanced web geometry ----
+    // Corner strips are STATIC; only the per-instance stream is rewritten each frame.
+    // Edge corners run 0..1 along the segment and -1..1 across it; node corners are a
+    // plain centred quad.
+    const mkInstanced = (corners, instStride, attrs, capBytes) => {
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      const cb = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+      gl.bufferData(gl.ARRAY_BUFFER, corners, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      const ib = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, ib);
+      gl.bufferData(gl.ARRAY_BUFFER, capBytes, gl.DYNAMIC_DRAW);
+      for (const [loc, size, offset] of attrs){
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, size, gl.FLOAT, false, instStride, offset);
+        gl.vertexAttribDivisor(loc, 1);            // advance once per instance, not per vertex
+      }
+      gl.bindVertexArray(null);
+      return [vao, ib];
+    };
+    [edgeVAO, edgeInstBuf] = mkInstanced(
+      new Float32Array([0,-1, 0,1, 1,-1, 1,1]), 24,
+      [[1,4,0],[2,2,16]], MAXE*24);               // i_seg(vec4) + i_meta(vec2)
+    [nodeVAO, nodeInstBuf] = mkInstanced(
+      new Float32Array([-1,-1, -1,1, 1,-1, 1,1]), 16,
+      [[1,4,0]], MAXN*16);                        // i_node(vec4)
 
     // fft texture (unit 0 everywhere)
     const bins = analyser ? analyser.frequencyBinCount : 1024;
@@ -960,13 +1114,34 @@
     gl.uniform2f(U(progBlur,'u_dir'), dx, dy);
     drawQuad();
   }
-  function postProcess(S){
+  // run the mode's frame through the feedback buffer; returns the RT post should read
+  function applyTrails(S){
+    const dst = trailRT[trailCur], prev = trailRT[1-trailCur];
+    bindRT(dst);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progTrail);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, prev.tex);
+    gl.uniform1i(U(progTrail,'u_scene'), 1);
+    gl.uniform1i(U(progTrail,'u_prev'), 2);
+    gl.uniform2f(U(progTrail,'u_res'), dst.w, dst.h);
+    // longer smear as tension builds; calm mode keeps it short so motion stays legible
+    const decay = S.safe < 0.5 ? 0.70 : Math.min(0.93, 0.84 + S.coil*0.08);
+    gl.uniform1f(U(progTrail,'u_decay'), decay);
+    gl.uniform1f(U(progTrail,'u_zoom'), 1.0 - (0.004 + S.beat*0.010*S.safe));
+    gl.uniform1f(U(progTrail,'u_rot'), (0.0015 + S.beat*0.005) * S.safe);
+    gl.uniform1f(U(progTrail,'u_hue'), 0.02 + S.burst*0.05);
+    drawQuad();
+    trailCur = 1 - trailCur;
+    return dst;
+  }
+  function postProcess(S, srcRT){
     gl.disable(gl.BLEND);
     // bright-pass into the half-res octave
     bindRT(bloom1[0]);
     gl.useProgram(progBright);
     gl.uniform1i(U(progBright,'u_src'), 1);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, srcRT.tex);
     gl.uniform2f(U(progBright,'u_dstTexel'), 1/bloom1[0].w, 1/bloom1[0].h);
     gl.uniform2f(U(progBright,'u_srcTexel'), 1/RW, 1/RH);
     // threshold above the diffuse range so only genuine HIGHLIGHTS bloom. Set it low
@@ -983,7 +1158,7 @@
 
     bindRT(null);
     gl.useProgram(progPost);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, srcRT.tex);
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, bloom1[0].tex);
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, bloom2[1].tex);
     gl.uniform1i(U(progPost,'u_scene'), 1);
@@ -996,6 +1171,10 @@
     gl.uniform1f(U(progPost,'u_bloomAmt'), S.safe < 0.5 ? 0.26 : 0.42);
     gl.uniform1f(U(progPost,'u_ca'), 1.0);
     gl.uniform1f(U(progPost,'u_sat'), 1.45);
+    // Per-frame random grain is the worst case for a video codec -- it is new detail in
+    // every frame, so it eats the bitrate that should be describing the actual image.
+    // Back it off while recording; on screen it stays at full strength.
+    gl.uniform1f(U(progPost,'u_grain'), recording ? 0.005 : 0.018);
     drawQuad();
     gl.activeTexture(gl.TEXTURE0);
   }
@@ -1193,57 +1372,128 @@
   }
 
   // ---------------- Neural web (geometry fed to the GPU each frame) ----------------
-  const MAXN = 48, MAXE = 96, MAXF = 24;
-  const nodeBuf = new Float32Array(MAXN*3);   // x, y, energy
-  const edgeBuf = new Float32Array(MAXE*4);   // x1,y1,x2,y2
+  // The web is a real FORCE-DIRECTED GRAPH now: nodes carry velocity and are pushed
+  // apart by their neighbours, pulled together along their edges, and held inside the
+  // frame by a soft elliptical shell. Nothing has a fixed home any more, so the layout
+  // keeps reorganising itself over the course of a song.
+  const MAXN = 512, MAXE = MAXN*3, MAXF = 24;
+  // interleaved instance streams uploaded straight to the GPU (see mkInstanced)
+  const nodeBuf = new Float32Array(MAXN*4);   // x, y, energy, seed
+  const edgeBuf = new Float32Array(MAXE*6);   // ax, ay, bx, by, energy, seed
+  let liveN = 0, liveE = 0;                   // instances actually written this frame
   const figBuf  = new Float32Array(MAXF*2);   // silhouette outline points (uv space)
   let figN = 0;                               // active outline points this frame
   const figA = new Float32Array(3), figB = new Float32Array(3);  // body / rim color
   let currentN = 0;                            // active node count (scalable)
   let netNodes = [], netEdges = [], netOn = true;
+  let relaxT = 0;                              // countdown to the next edge rebuild
   // pointer/drag influence on the neural web (uv-space cursor position)
   const mouse = { x: 0, y: 0, down: false, over: false };
+
+  // Hundreds of nodes only pay off if the machine can carry them. Phones get a much
+  // lower ceiling -- the cost is fill rate (every node is a translucent quad), which is
+  // exactly what mobile GPUs are worst at.
+  // uv half-extents the web lives in. W/H are still 0 at module-eval time (resize()
+  // runs during boot), so fall back to the default 9:16 rather than seeding NaNs.
+  function webExtent(){
+    const a = (W && H) ? W/H : 9/16;
+    return [0.5*a*1.1, 0.55];
+  }
+
+  function webNodeCap(){
+    let coarse = false;
+    try { coarse = matchMedia('(pointer:coarse)').matches; } catch(e){}
+    const cores = navigator.hardwareConcurrency || 4;
+    return Math.min(MAXN, coarse ? 140 : (cores >= 8 ? 400 : 240));
+  }
+
   function initNet(N){
-    N = Math.max(3, Math.min(MAXN, N|0));
+    N = Math.max(3, Math.min(webNodeCap(), N|0));
     currentN = N;
     netNodes = [];
-    const ringN = Math.max(3, Math.floor(N*0.55));      // how many sit on the outer ring
     for (let i=0;i<N;i++){
-      const ring = i < ringN;
-      const ang  = ring ? (i/ringN)*Math.PI*2 : Math.random()*Math.PI*2;
-      const rad  = ring ? 0.9 : Math.random()*0.82;     // logical [-1,1] space (fuller spread)
+      const ang = Math.random()*Math.PI*2;
+      // sqrt() spreads the seed positions evenly over the disc; a plain uniform radius
+      // piles them into the middle and the solver then has to spend seconds pushing
+      // them back out (the 2D form of the nebula's cube-root lesson).
+      const rad = Math.sqrt(Math.random());
       netNodes.push({
-        hx: Math.cos(ang)*rad, hy: Math.sin(ang)*rad,
-        x:0, y:0, phase: Math.random()*Math.PI*2,
-        spd: 0.4 + Math.random()*1.5,                   // rapid drift
-        r:   0.02 + Math.random()*0.07,                  // drift radius (uv units)
+        x: Math.cos(ang)*rad, y: Math.sin(ang)*rad,      // uv space, filled in by scaleSeed
+        vx: 0, vy: 0, ax: 0, ay: 0,
+        // each node seeks its OWN shell radius, so the graph fills the frame instead of
+        // collapsing to a point or bunching on one ring
+        rT: 0.12 + Math.random()*0.78,
+        seed: Math.random(),
         band: 2 + Math.floor(Math.pow(i/N,1.6)*200),
-        e: 0, ring,                                      // ring nodes are the stable skeleton
-        ox:0, oy:0, ovx:0, ovy:0,                        // drag offset + velocity (springy)
-        vis:1, vtar:1, flash:0,                          // quantum-vacuum life (inner nodes)
-        tflip: 0.5 + Math.random()*3                     // countdown to next pop
+        e: 0,
+        ring: rad > 0.78,                                 // outer nodes are the stable skeleton
+        vis:1, vtar:1, flash:0,                           // quantum-vacuum life (inner nodes)
+        tflip: 0.5 + Math.random()*3                      // countdown to next pop
       });
     }
-    // wire each node to its 2 nearest neighbors (by home position), de-duplicated
-    const seen = new Set(); netEdges = [];
-    for (let i=0;i<netNodes.length;i++){
-      const dl = [];
-      for (let j=0;j<netNodes.length;j++) if (j!==i){
-        const dx=netNodes[i].hx-netNodes[j].hx, dy=netNodes[i].hy-netNodes[j].hy;
-        dl.push([dx*dx+dy*dy, j]);
+    const [hw, hh] = webExtent();
+    for (const n of netNodes){ n.x *= hw; n.y *= hh; }
+    relaxT = 0;                                           // wire it up on the next frame
+    rebuildEdges();
+  }
+
+  // Rewire each node to its nearest neighbours. Called periodically, NOT every frame:
+  // the graph is always drifting, so re-running this is what makes the web visibly
+  // reorganise -- but doing it every frame makes the edges strobe.
+  function rebuildEdges(){
+    const N = netNodes.length;
+    if (N < 2){ netEdges = []; return; }
+    // Spatial hash: at 400 nodes an all-pairs scan is 160k distance tests per rebuild.
+    // Bucketing by a cell the size of the interaction radius makes it near-linear.
+    const cell = neighborRadius(N);
+    const grid = new Map();
+    const key = (cx,cy) => cx*73856093 ^ cy*19349663;
+    for (let i=0;i<N;i++){
+      const n = netNodes[i];
+      const k = key(Math.floor(n.x/cell), Math.floor(n.y/cell));
+      let b = grid.get(k); if (!b){ b = []; grid.set(k, b); }
+      b.push(i);
+    }
+    const seen = new Set(); const out = [];
+    const K = N > 220 ? 2 : 3;                   // degree: keep the picture readable
+    const cand = [];
+    for (let i=0;i<N && out.length<MAXE;i++){
+      const n = netNodes[i];
+      const cx = Math.floor(n.x/cell), cy = Math.floor(n.y/cell);
+      cand.length = 0;
+      for (let ox=-1; ox<=1; ox++) for (let oy=-1; oy<=1; oy++){
+        const b = grid.get(key(cx+ox, cy+oy));
+        if (!b) continue;
+        for (const j of b) if (j !== i){
+          const dx = n.x-netNodes[j].x, dy = n.y-netNodes[j].y;
+          cand.push([dx*dx+dy*dy, j]);
+        }
       }
-      dl.sort((a,b)=>a[0]-b[0]);
-      for (let k=0;k<2;k++){
-        const j = dl[k][1], key = i<j ? i+'-'+j : j+'-'+i;
-        if (!seen.has(key) && netEdges.length<MAXE){ seen.add(key); netEdges.push([i,j]); }
+      cand.sort((a,b)=>a[0]-b[0]);
+      for (let k=0;k<Math.min(K, cand.length) && out.length<MAXE;k++){
+        const j = cand[k][1], kk = i<j ? i*MAXN+j : j*MAXN+i;
+        if (!seen.has(kk)){ seen.add(kk); out.push([i,j]); }
       }
     }
+    netEdges = out;
   }
-  initNet(32);
+
+  // Characteristic spacing: the radius at which nodes start pushing each other away,
+  // and the yardstick for spring rest length, feature size and edge bucketing. It has
+  // to fall as the count rises or a dense graph is one solid mat of light.
+  function neighborRadius(N){
+    const [hw, hh] = webExtent();
+    return Math.max(0.02, 1.45 * Math.sqrt(hw*hh*Math.PI / Math.max(4,N)));
+  }
+
+  // seed from the slider's own default so the graph and the control agree on load
+  initNet(sliderToNodes(+nodeSlider.value));
   // Slider 0..1 -> node count with a gentle ("tepid") logarithmic curve:
   // fine control over small counts, quicker growth toward the top.
   function sliderToNodes(s){
-    const minN = 5, maxN = 46, k = 5;   // k = curvature (1 = linear, higher = more log)
+    // Heavy curvature: the top of the slider now reaches hundreds of nodes, so the
+    // useful 20-150 range has to occupy most of the travel instead of the last 10%.
+    const minN = 6, maxN = webNodeCap(), k = 500;
     return Math.round(minN + (maxN-minN) * (Math.pow(k, s)-1) / (k-1));
   }
   function setNodeCount(N){ if (N !== currentN) initNet(N); }
@@ -1269,10 +1519,10 @@
   ];
   let coh = 0, shapeIdx = 0, shapeDwell = 0;
   let shapeSpin = 0, netTime = 0;   // accumulating figure rotation + local clock
-  let testCoh = null;   // harness override so silhouettes can be screenshotted
+  let testCoh = null, testShape = null;   // harness overrides so silhouettes can be screenshotted
 
   function updateNet(dt, gain){
-    const hw = 0.5*W/H*1.1, hh = 0.5*1.1;   // uv half-extents (web spreads across the frame)
+    const [hw, hh] = webExtent();           // uv half-extents (web spreads across the frame)
     // syncRatio gently swells/settles the whole web's energy on its own -- the
     // automatic version of nudging the "Sync" slider. Manual gain still stacks on top.
     const syncGain = 0.65 + syncRatio*0.7;
@@ -1290,48 +1540,115 @@
     if ((beat > 0.55 && shapeDwell > 1.6) || shapeDwell > 5.0){
       shapeIdx = (shapeIdx + 1) % SHAPES.length; shapeDwell = 0;
     }
+    // the harness relaxes the solver for a couple of seconds before screenshotting,
+    // which is long enough to trip the morph -- pin the shape so ?shape= stays honest
+    if (testShape != null) shapeIdx = testShape;
     if (testCoh != null) coh = testCoh;
-    const forming = coh > 0.04;
     // figure rotation: geometric Angels tumble (rate rises with bass + beat);
     // humanoid forms (spin 0) rock gently so they never flip upside-down.
     netTime += dt;
     shapeSpin += dt * (shp.spin||0) * (0.35 + bassSmooth*1.4 + beat*0.8);
     const figAng = (shp.spin||0) ? shapeSpin : Math.sin(netTime*1.2)*0.16*coh;
     const fcs = Math.cos(figAng), fsn = Math.sin(figAng);
-    for (let i=0;i<netNodes.length;i++){
+    // ---- force-directed relaxation --------------------------------------------
+    // Every node carries velocity. Three standing forces (neighbour repulsion, edge
+    // springs, a soft elliptical shell) settle the graph; the music perturbs it. There
+    // are no home positions, so the layout genuinely reorganises as the song moves.
+    const N = netNodes.length;
+    const Rn = neighborRadius(N);
+    const step = Math.min(dt, 1/30);                  // a stalled tab must not explode the sim
+    const damp = Math.pow(0.87, step*60);             // frame-rate independent damping
+    // the graph OPENS on a release and draws TIGHT as tension winds up
+    const spread = (1 + bassSmooth*0.16 + burst*0.35) * (1 - coil*0.22) * (1 - coh*0.28);
+    const L0   = Rn * 0.62 * spread;                  // spring rest length
+    const KSPR = 30 * (1 + coil*1.2);                 // tension makes the lattice taut
+    const KREP = 60, KSHELL = 20;
+
+    for (let i=0;i<N;i++){
       const n = netNodes[i];
       n.e = freqData ? Math.min((freqData[n.band]/255)*gain*syncGain, 1.3) : 0;
-      n.phase += dt * n.spd * (1 + n.e*1.5 + beat*4.0);   // profound beats agitate the web harder
-      // web stays free (no stick-figure snapping); as the figure forms it gently
-      // converges inward and the shader fades the web out, leaving the solid figure.
-      // breathing acts on each node's LOCAL drift around its own home -- NOT a global
-      // pull to center -- so the web stays spread across the frame and shows behavior
-      // throughout. coil tightens the drift into a taut, trembling lattice; burst jolts
-      // each node outward from its home (dispersal), then it settles.
-      const rr = (n.r*(1 + n.e*0.9) + beat*beat*0.10) * (1 - coil*0.6) * (1 + burst*2.2);
-      const gather = 1 - coh*0.30;                     // mild inward pull only while a figure forms
-      let bx = n.hx*hw*gather + Math.cos(n.phase)*rr;
-      let by = n.hy*hh*gather + Math.sin(n.phase*1.3)*rr;
+      n.ax = 0; n.ay = 0;
+    }
+
+    // Repulsion, bucketed by a cell the size of the interaction radius. All-pairs would
+    // be 160k tests per frame at 400 nodes; this only ever looks at the 3x3 neighbourhood.
+    const cell = Rn, grid = new Map();
+    const gkey = (cx,cy) => cx*73856093 ^ cy*19349663;
+    for (let i=0;i<N;i++){
+      const n = netNodes[i];
+      const k = gkey(Math.floor(n.x/cell), Math.floor(n.y/cell));
+      let b = grid.get(k); if (!b){ b = []; grid.set(k, b); }
+      b.push(i);
+    }
+    for (let i=0;i<N;i++){
+      const a = netNodes[i];
+      const cx = Math.floor(a.x/cell), cy = Math.floor(a.y/cell);
+      for (let ox=-1; ox<=1; ox++) for (let oy=-1; oy<=1; oy++){
+        const b = grid.get(gkey(cx+ox, cy+oy));
+        if (!b) continue;
+        for (const j of b){
+          if (j <= i) continue;                        // each pair once, applied both ways
+          const o = netNodes[j];
+          let dx = a.x-o.x, dy = a.y-o.y;
+          const d2 = dx*dx + dy*dy;
+          if (d2 > Rn*Rn || d2 < 1e-12) continue;
+          const d = Math.sqrt(d2), w = 1 - d/Rn;
+          const f = KREP * w * w / d;
+          dx *= f; dy *= f;
+          a.ax += dx; a.ay += dy; o.ax -= dx; o.ay -= dy;
+        }
+      }
+    }
+    // Edge springs
+    for (let k=0;k<netEdges.length;k++){
+      const [i,j] = netEdges[k];
+      const a = netNodes[i], o = netNodes[j];
+      let dx = o.x-a.x, dy = o.y-a.y;
+      const d = Math.hypot(dx,dy) || 1e-5;
+      const f = KSPR * (d - L0) / d;
+      dx *= f; dy *= f;
+      a.ax += dx; a.ay += dy; o.ax -= dx; o.ay -= dy;
+    }
+    // Shell containment + music + cursor, then integrate
+    const vmax = 2.2;
+    for (let i=0;i<N;i++){
+      const n = netNodes[i];
+      // measured in normalised ellipse coords so a 9:16 frame gets an elliptical
+      // shell, not a circle with dead bands down both sides
+      const ex = n.x/hw, ey = n.y/hh;
+      const r  = Math.hypot(ex, ey) || 1e-5;
+      const dirx = ex/r, diry = ey/r;
+      const rT = n.rT * spread;
+      const pull = -KSHELL * (r - rT);
+      n.ax += dirx * hw * pull;
+      n.ay += diry * hh * pull;
+      // beats shove nodes outward (movement, never brightness); the release does it harder
+      const kick = (beat*beat*0.22 + burst*0.30) * cf;
+      n.ax += dirx * kick * 2.4;
+      n.ay += diry * kick * 2.4;
+      // a little wander so a settled graph still breathes instead of freezing solid
+      const ph = n.seed*6.2831;
+      n.ax += Math.cos(netTime*(0.7 + n.seed*1.3) + ph) * (0.5 + n.e*1.6);
+      n.ay += Math.sin(netTime*(0.6 + n.seed*1.1) + ph*1.7) * (0.5 + n.e*1.6);
       if (coil > 0.05){                                // wound-up tension trembles in place
-        const tr = coil*0.02;
-        bx += Math.sin(netTime*40 + n.phase*7)*tr;
-        by += Math.cos(netTime*37 + n.phase*5)*tr;
+        const tr = coil*6.0;
+        n.ax += Math.sin(netTime*40 + ph*7)*tr;
+        n.ay += Math.cos(netTime*37 + ph*5)*tr;
       }
-      // cursor influence: DRAG pulls nodes toward the cursor; a bare HOVER pushes
-      // them away (repulsion). Both use a spring + damping so they settle naturally.
-      let tx = 0, ty = 0;
+      // cursor: DRAG pulls nodes in, a bare HOVER pushes them away
       if (mouse.down){
-        const dx = mouse.x - bx, dy = mouse.y - by, d = Math.hypot(dx,dy), R = 0.55;
-        if (d < R){ const w = 1 - d/R; tx = dx*w*0.9; ty = dy*w*0.9; n.e = Math.min(1.3, n.e + w*0.6); }
+        const dx = mouse.x-n.x, dy = mouse.y-n.y, d = Math.hypot(dx,dy), R = 0.55;
+        if (d < R){ const w = 1-d/R; n.ax += dx*w*26; n.ay += dy*w*26; n.e = Math.min(1.3, n.e + w*0.6); }
       } else if (mouse.over){
-        const dx = bx - mouse.x, dy = by - mouse.y, d = Math.hypot(dx,dy) || 1e-4, R = 0.4;
-        if (d < R){ const w = 1 - d/R; tx = (dx/d)*w*0.32; ty = (dy/d)*w*0.32; n.e = Math.min(1.3, n.e + w*0.25); }
+        const dx = n.x-mouse.x, dy = n.y-mouse.y, d = Math.hypot(dx,dy) || 1e-4, R = 0.4;
+        if (d < R){ const w = 1-d/R; n.ax += (dx/d)*w*14; n.ay += (dy/d)*w*14; n.e = Math.min(1.3, n.e + w*0.25); }
       }
-      n.ovx = (n.ovx + (tx - n.ox)*0.18) * 0.86;
-      n.ovy = (n.ovy + (ty - n.oy)*0.18) * 0.86;
-      n.ox += n.ovx; n.oy += n.ovy;
-      n.x = bx + n.ox;
-      n.y = by + n.oy;
+      n.vx = (n.vx + n.ax*step) * damp;
+      n.vy = (n.vy + n.ay*step) * damp;
+      const sp = Math.hypot(n.vx, n.vy);
+      if (sp > vmax){ n.vx = n.vx/sp*vmax; n.vy = n.vy/sp*vmax; }
+      n.x += n.vx*step;
+      n.y += n.vy*step;
       // life: inner nodes keep the quantum-vacuum flicker (a spark on each wink),
       // popping faster on their band; ring nodes stay lit.
       if (!n.ring){
@@ -1345,24 +1662,36 @@
         n.flash *= 0.85;
       }
     }
-    for (let i=0;i<MAXN;i++){
-      if (i<netNodes.length){ const n = netNodes[i];
-        // rendered energy folds in visibility + the transition spark
-        const z = n.e*n.vis + n.flash*0.9*cf;
-        nodeBuf[i*3]=n.x; nodeBuf[i*3+1]=n.y; nodeBuf[i*3+2]=z;
-      } else { nodeBuf[i*3]=99; nodeBuf[i*3+1]=99; nodeBuf[i*3+2]=0; }
+    // Rewire periodically (and on a hard hit). This is the visible payoff of the solver:
+    // as nodes migrate, who they are connected to actually changes.
+    relaxT -= dt;
+    if (relaxT <= 0 || (beat > 0.7 && relaxT < 0.5)){
+      rebuildEdges();
+      relaxT = 0.9 + Math.random()*0.8;
     }
-    // web edges (the figure is drawn by the shader's filled SDF, not by these)
-    for (let i=0;i<MAXE;i++){
-      if (i<netEdges.length){ const [a,b]=netEdges[i];
-        // an edge vanishes with its node so vacuum pops read cleanly (ring nodes stay lit)
-        if (netNodes[a].vis < 0.3 || netNodes[b].vis < 0.3){
-          edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99;
-        } else {
-          edgeBuf[i*4]=netNodes[a].x; edgeBuf[i*4+1]=netNodes[a].y;
-          edgeBuf[i*4+2]=netNodes[b].x; edgeBuf[i*4+3]=netNodes[b].y;
-        }
-      } else { edgeBuf[i*4]=edgeBuf[i*4+1]=edgeBuf[i*4+2]=edgeBuf[i*4+3]=99; }
+
+    // ---- pack the instance streams (skip anything winked out; no sentinel padding) ----
+    liveN = 0;
+    for (let i=0;i<N;i++){
+      const n = netNodes[i];
+      if (n.vis < 0.02) continue;
+      const o = liveN*4;
+      nodeBuf[o]   = n.x; nodeBuf[o+1] = n.y;
+      nodeBuf[o+2] = n.e*n.vis + n.flash*0.9*cf;       // energy folds in the vacuum spark
+      nodeBuf[o+3] = n.seed;
+      liveN++;
+    }
+    liveE = 0;
+    // an edge vanishes with its node so vacuum pops read cleanly (ring nodes stay lit)
+    for (let k=0;k<netEdges.length && liveE<MAXE;k++){
+      const a = netNodes[netEdges[k][0]], b = netNodes[netEdges[k][1]];
+      if (a.vis < 0.3 || b.vis < 0.3) continue;
+      const o = liveE*6;
+      edgeBuf[o]   = a.x; edgeBuf[o+1] = a.y;
+      edgeBuf[o+2] = b.x; edgeBuf[o+3] = b.y;
+      edgeBuf[o+4] = (a.e + b.e)*0.5;
+      edgeBuf[o+5] = (k*0.618034 + 0.31) % 1;          // stable per-edge packet phase
+      liveE++;
     }
     // build the figure outline: spin each point, scale to uv, upload as u_fig.
     // 0.62 keeps the construct floating in frame instead of filling it.
@@ -1493,9 +1822,6 @@
     gl.uniform1f(U(progWeb,'u_safe'), S.safe);
     gl.uniform3fv(U(progWeb,'u_c1'), S.c1);
     gl.uniform3fv(U(progWeb,'u_c2'), S.c2);
-    gl.uniform3fv(U(progWeb,'u_nodes'), nodeBuf);
-    gl.uniform4fv(U(progWeb,'u_edges'), edgeBuf);
-    gl.uniform1f(U(progWeb,'u_net'), netOn ? 1 : 0);
     gl.uniform1f(U(progWeb,'u_coh'), netOn ? coh : 0);
     gl.uniform1f(U(progWeb,'u_coil'), S.coil);
     gl.uniform1f(U(progWeb,'u_burst'), S.burst);
@@ -1504,6 +1830,59 @@
     gl.uniform3fv(U(progWeb,'u_figA'), figA);
     gl.uniform3fv(U(progWeb,'u_figB'), figB);
     drawQuad();
+    if (netOn) drawNet(S);
+  }
+
+  // The web itself: two instanced passes drawn additively on top of the background.
+  function drawNet(S){
+    // Feature size and per-node brightness both fall as the count rises. Without that,
+    // 400 nodes at the 32-node scale is a single saturated mat -- the additive pile-up
+    // failure mode, the same one that bit the nebula.
+    const N = Math.max(8, currentN);
+    const scale = Math.min(1, Math.sqrt(32/N));
+    const ngain = Math.max(0.30, Math.pow(32/N, 0.40));
+    // exposure dims the web far less than the background, and it RECEDES as the figure
+    // coalesces so the silhouette reads; tension glows, release flashes (restrained).
+    const gain = (S.expo + (1 - S.expo)*0.5) * (1 - coh*0.30) * (1 + S.coil*0.18 + S.burst*0.30);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);                   // additive: this is emissive light
+    const xf = (p) => {
+      gl.uniform2f(U(p,'u_res'), RW, RH);
+      gl.uniform1f(U(p,'u_time'), S.t);
+      gl.uniform1f(U(p,'u_beat'), S.beat);
+      gl.uniform1f(U(p,'u_burst'), S.burst);
+      gl.uniform1f(U(p,'u_coil'), S.coil);
+      gl.uniform1f(U(p,'u_safe'), S.safe);
+      gl.uniform1f(U(p,'u_gain'), gain);
+      gl.uniform1f(U(p,'u_scale'), scale);
+    };
+    if (liveE){
+      gl.useProgram(progEdge);
+      xf(progEdge);
+      gl.uniform3fv(U(progEdge,'u_c1'), S.c1);
+      // the quad has to be wide enough to contain the widest thing drawn in it --
+      // the data packets (0.013) -- or they get sliced off at the quad edge
+      gl.uniform1f(U(progEdge,'u_wide'), 0.020*scale);
+      gl.bindVertexArray(edgeVAO);
+      gl.bindBuffer(gl.ARRAY_BUFFER, edgeInstBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, edgeBuf, 0, liveE*6);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, liveE);
+    }
+    if (liveN){
+      gl.useProgram(progNode);
+      xf(progNode);
+      gl.uniform3fv(U(progNode,'u_c1'), S.c1);
+      gl.uniform3fv(U(progNode,'u_c2'), S.c2);
+      gl.uniform1f(U(progNode,'u_ngain'), ngain);
+      gl.uniform1f(U(progNode,'u_rad'), 0.17*scale);   // must cover halo + gas + haze
+      gl.bindVertexArray(nodeVAO);
+      gl.bindBuffer(gl.ARRAY_BUFFER, nodeInstBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, nodeBuf, 0, liveN*4);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, liveN);
+    }
+    gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
   }
   function drawNebula(S, dt){
     bindRT(sceneRT);
@@ -1554,7 +1933,7 @@
     gl.bindTexture(gl.TEXTURE_2D, fftTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
     if (modeId === 'nebula' && nebulaOK) drawNebula(S, dt); else drawWeb(S);
-    postProcess(S);
+    postProcess(S, trailsOn ? applyTrails(S) : sceneRT);
   }
   // the per-frame state every mode and the post chain reads
   function frameState(t, a){
@@ -1826,7 +2205,13 @@
 
   // ---------------- Recording ----------------
   let recorder=null, chunks=[], recStart=0, recTimer=null, recMime='video/webm';
+  // read by adaptResolution() and the grain in postProcess() -- a take must not be
+  // degraded by the things that keep the LIVE view smooth
+  let recording=false;
   function startRec(){
+    // lock the internal render back to full size for the take (see adaptResolution)
+    recording = true;
+    if (renderScale !== 1){ renderScale = 1; allocRTs(W, H); }
     const stream = view.captureStream(60);
     const tracks = [...stream.getVideoTracks()];
     if (destNode && destNode.stream.getAudioTracks().length) tracks.push(...destNode.stream.getAudioTracks());
@@ -1837,7 +2222,10 @@
                   'video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm']
                  .find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
     recMime = mime;
-    try { recorder = new MediaRecorder(mixed, { mimeType:mime, videoBitsPerSecond:14_000_000 }); }
+    // 1080p60 of fine particle detail, scanlines and glow is close to worst-case for a
+    // codec (lots of high-frequency, high-motion content), so it needs a fat bitrate.
+    const bits = W*H >= 1920*1080 ? 40_000_000 : 28_000_000;
+    try { recorder = new MediaRecorder(mixed, { mimeType:mime, videoBitsPerSecond:bits, audioBitsPerSecond:192_000 }); }
     catch(e){ recorder = new MediaRecorder(mixed); recMime = recorder.mimeType || 'video/webm'; }
     chunks=[];
     recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
@@ -1849,6 +2237,7 @@
   }
   function stopRec(){
     if (recorder && recorder.state!=='inactive') recorder.stop();
+    recording = false;
     recDot.style.display='none'; recBtn.textContent='● Rec'; clearInterval(recTimer);
   }
   function saveRec(){
@@ -1886,7 +2275,14 @@
     modeId = modeSel.value;
     nodeLbl.textContent = modeId === 'nebula' ? 'Density' : 'Nodes';
     netBtn.style.display = modeId === 'nebula' ? 'none' : '';
+    clearTrails();                       // don't ghost the mode we just left
     applySlider();
+  });
+  trailBtn.addEventListener('click', () => {
+    trailsOn = !trailsOn;
+    trailBtn.classList.toggle('primary', trailsOn);
+    trailBtn.textContent = trailsOn ? '✳ Trails' : '✳ Trails: Off';
+    clearTrails();
   });
   // sync button to the OS-default calm state applied at boot
   try { if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) safe = true; } catch(e){}
@@ -1950,6 +2346,7 @@
       safe  = tp('safe',0) > 0.5;
       netOn = tp('net',1) > 0.5;
       if (P.has('mode')){ modeId = P.get('mode')==='nebula' ? 'nebula' : 'web'; modeSel.value = modeId; }
+      if (P.has('trails')) trailsOn = tp('trails',1) > 0.5;
       if (P.has('density')) setDensity(tp('density',0.8));
       const bass=tp('bass',0.1), mid=tp('mid',0.1), treb=tp('treb',0.1), bt=tp('beat',0), tf=tp('t',2.0);
       const energy = bass*0.6 + mid*0.3 + treb*0.1;
@@ -1962,7 +2359,7 @@
       if (P.has('nodes')) setNodeCount(tp('nodes', currentN)|0);
       // coalescence override for headless verification: ?coh=1&shape=2
       if (P.has('coh'))   testCoh = tp('coh',1);
-      if (P.has('shape')) shapeIdx = Math.max(0, Math.min(SHAPES.length-1, tp('shape',0)|0));
+      if (P.has('shape')) testShape = shapeIdx = Math.max(0, Math.min(SHAPES.length-1, tp('shape',0)|0));
       if (P.has('coil'))  coil  = tp('coil',0);   // breathing overrides for headless verify
       if (P.has('burst')) burst = tp('burst',0);
       // simulate cursor for headless verification: ?mx=..&my=..&md=1 (drag) or &mh=1 (hover)
@@ -1999,21 +2396,31 @@
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, fftTex);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
-      updateNet(0, 1.0);
+      // The web is a force-directed solver now, so it has to RELAX before the shot --
+      // the same reason the nebula needs `warm`. At dt=0 nothing moves and the frame
+      // only ever shows the random seed scatter, not a settled graph.
+      const relaxN = P.has('relax') ? (tp('relax',150)|0) : 150;
+      for (let i=0;i<relaxN;i++) updateNet(1/60, 1.0);
       if (modeId === 'nebula' && nebulaOK){
         // settle the cloud: the sim is iterative, so a single step would only ever
         // screenshot the seed distribution. Warm it up with fixed steps first.
         const warm = P.has('warm') ? (tp('warm',180)|0) : 180;
         for (let i=0;i<warm;i++) simParticles({...S, t: tf - (warm-i)*0.016}, 0.016);
       }
+      // ?anim=N advances time over N frames instead of repeating one instant. Anything
+      // built up over time -- feedback trails, the particle sim -- is invisible in a
+      // static render, so it needs real frames to accumulate before the screenshot.
+      const animN = P.has('anim') ? Math.max(1, tp('anim',45)|0) : 0;
+      const frames = animN || 6;
       let _tframes = 0;
       (function testLoop(){
-        renderFrame(S, 0.016);
+        if (animN){ S.t = tf + _tframes/60; updateNet(1/60, 1.0); }
+        renderFrame(S, 1/60);
         vctx.drawImage(glCanvas, 0, 0, W, H);
-        drawHUD({bass,mid,treb,energy}, tf*1000);
-        // render a few static frames then STOP so headless virtual-time can idle
+        drawHUD({bass,mid,treb,energy}, (tf + _tframes/60)*1000);
+        // render a few frames then STOP so headless virtual-time can idle
         // (the frame is deterministic, so this settles immediately) and screenshot.
-        if (++_tframes < 6) requestAnimationFrame(testLoop);
+        if (++_tframes < frames) requestAnimationFrame(testLoop);
       })();
       return; // skip the normal idle preview
     }
