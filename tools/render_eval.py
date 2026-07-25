@@ -22,7 +22,10 @@ EVA = "file://" + os.path.abspath(os.environ.get(
     "EVA_FILE", os.path.join(os.path.dirname(__file__), "..", "eva.html")))
 OUT = os.path.abspath(os.environ.get(
     "EVAL_OUT", os.path.join(os.path.dirname(__file__), "..", "scratchpad_eval")))
-W, H = 960, 540          # browser window
+# Taller window than the canvas needs: the control bar sits ABOVE the stage, so a
+# short window makes UI changes shrink the rendered preview and silently corrupt
+# every measurement. Give the stage room so metrics track the visuals, not the layout.
+W, H = 960, 1000         # browser window
 TW, TH = 200, 356        # contact-sheet thumb (the frame itself is 9:16)
 
 # (label, query string). Each is one rendered state.
@@ -94,7 +97,7 @@ def crop_frame(im):
     why 'non-black %' used to sit near 24 regardless of what was on screen). Take the
     stage area above the seek bar, then the bounding box of what is actually lit.
     """
-    stage = im.crop((0, 0, im.width, int(im.height * 0.64)))
+    stage = im.crop((0, 0, im.width, int(im.height * 0.78)))
     mask = stage.convert("L").point(lambda v: 255 if v > 10 else 0)
     bb = mask.getbbox()
     return stage.crop(bb) if bb else stage

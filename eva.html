@@ -99,7 +99,13 @@
   .brand { font-weight: 700; letter-spacing: 3px; font-size: 14px; color: var(--amber); margin-right: 4px; }
 
   @media (max-width: 760px) { .brand, .sep { display: none; } #controls { padding: 9px; gap: 6px; } }
-</style>
+  input[type=text]{
+    background:#120d16; color:#ffd9a8; border:1px solid #3a2b1c; border-radius:4px;
+    padding:4px 6px; font:inherit; font-size:11px; width:82px; letter-spacing:.04em;
+  }
+  input[type=text]::placeholder{ color:#6b5540; }
+  input[type=text]:focus{ outline:none; border-color:#ffb45a; }
+  </style>
 </head>
 <body>
   <div id="stage">
@@ -158,6 +164,10 @@
     </div>
     <div class="sep"></div>
     <div class="group">
+      <input type="text" id="titleIn" maxlength="40" placeholder="TRACK" title="Your track name — burned into the recording, inside Instagram's safe area">
+      <input type="text" id="artistIn" maxlength="30" placeholder="ARTIST" title="Your name — burned into the recording">
+      <button id="hudBtn" class="primary" title="NERV overlay on/off — turn it off for a clean look that's yours">▣ HUD</button>
+      <button id="randBtn" title="Jump to a random engine / palette / density">⇄ Random</button>
       <button id="fpBtn" title="Song fingerprint — a unique portrait of this track">◎ Print</button>
       <button id="fpSaveBtn" title="Download the fingerprint as a PNG">⤓ Save</button>
     </div>
@@ -205,6 +215,10 @@
   const nodeLbl   = document.getElementById('nodeLbl');
   const ratioSel  = document.getElementById('ratioSel');
   const recBtn    = document.getElementById('recBtn');
+  const titleIn   = document.getElementById('titleIn');
+  const artistIn  = document.getElementById('artistIn');
+  const hudBtn    = document.getElementById('hudBtn');
+  const randBtn   = document.getElementById('randBtn');
   const clipSel   = document.getElementById('clipSel');
   const safeAreaBtn = document.getElementById('safeAreaBtn');
   const recDot    = document.getElementById('recDot');
@@ -1073,7 +1087,10 @@
     vec3 p = vec3(a_pos.x*cy + a_pos.z*sy, a_pos.y, -a_pos.x*sy + a_pos.z*cy);
     // pitch matters more than it looks: near edge-on the disc projects to a thin ellipse
     // and every particle overlaps every other one, which saturates to a white smear
-    float pit = 0.50 + sin(u_time*0.11)*0.12;
+    // Nearer face-on than before. Counter-intuitively this also REDUCES saturation:
+    // edge-on stacks the whole disc along the view ray, face-on spreads it out. It is
+    // also the only angle from which the spiral arms are legible at all.
+    float pit = 1.02 + sin(u_time*0.11)*0.16;
     float cp = cos(pit), sp = sin(pit);
     p = vec3(p.x, p.y*cp - p.z*sp, p.y*sp + p.z*cp);
     float z = max(p.z + u_cam, 0.08);
@@ -2428,12 +2445,14 @@
     gl.uniform1f(U(progSim,'u_safe'), S.safe);
     // the cloud's target radius: swells with bass, is reeled IN as tension winds up,
     // and is thrown wide open by the release -- the breathing the web already does.
-    gl.uniform1f(U(progSim,'u_shell'), 0.78 + S.bass*0.50 + S.burst*0.40 - S.coil*0.30);
+    gl.uniform1f(U(progSim,'u_shell'), 1.18 + S.bass*0.55 + S.burst*0.45 - S.coil*0.35);
     gl.uniform1f(U(progSim,'u_flow'),  1.15 + S.treb*0.85 + S.coil*0.70);
     // rotation now leads: it was 1.50 against a curl field several times stronger
     gl.uniform1f(U(progSim,'u_swirl'), 5.20 + S.treb*2.2 + S.coil*3.2 + S.beat*1.6);
     // disc thickness: flares open on bass and on the release, never fully flat
-    gl.uniform1f(U(progSim,'u_disc'), 14.0 - S.bass*5.0 - S.burst*7.0);
+    // a LENS, not a wafer: enough to give it an axis and a silhouette, not so much
+    // that it collapses to a transparent sheet
+    gl.uniform1f(U(progSim,'u_disc'), 1.7 - S.bass*0.7 - S.burst*1.1);
     // put the cursor into world space on the camera plane (undo the render yaw), so the
     // particles it grabs are the ones actually under the pointer
     const yaw = S.t*0.075 + S.bass*0.22, mx = mouse.x*2.4;
@@ -2441,6 +2460,13 @@
                  mouse.down ? 1 : (mouse.over ? 2 : 0));
 
     gl.bindVertexArray(pVAO[src]);
+    // WebGL2 forbids one buffer being bound to a transform-feedback binding point AND a
+    // non-TF point at the same time. initParticles() leaves pbuf[1].dat on the generic
+    // ARRAY_BUFFER binding, so every step with dst===1 was rejected with INVALID_OPERATION
+    // and wrote NOTHING -- pbuf[1] kept its JS seed data forever and the cloud was frozen
+    // at "seed + one 16ms step" no matter how many warm-up steps ran. Months of sim
+    // tuning did nothing because the sim was not running.
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfo);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, pbuf[dst].pos);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, pbuf[dst].vel);
@@ -2720,7 +2746,40 @@
     } else { hudLabelP = pri; hudLabelT = now; }
     return hudLabel;
   }
+  // The NERV chrome is the app's identity, but it is not the USER's -- nobody posts
+  // their own single branded as somebody else's world. So it is one layer among three:
+  // optional chrome, the user's own title, and the (never-recorded) safe-area guides.
+  let hudOn = true;
   function drawHUD(a, now){
+    if (hudOn) drawNervHUD(a, now);
+    drawTitleCard();
+    drawSafeArea(H/1080);
+  }
+  // The user's own credit, placed INSIDE the Reels safe area so Instagram's caption
+  // cannot bury it. Drawn on the view canvas, so it is part of the recording.
+  function drawTitleCard(){
+    const t = (titleIn.value || '').trim(), ar = (artistIn.value || '').trim();
+    if (!t && !ar) return;
+    const s = H/1080;
+    const x = W*SAFE.side + 16*s;
+    let y = H - H*SAFE.bottom - 26*s;
+    vctx.save();
+    vctx.textAlign = 'left'; vctx.textBaseline = 'alphabetic';
+    vctx.shadowColor = 'rgba(0,0,0,0.9)'; vctx.shadowBlur = 14*s;
+    if (ar){
+      vctx.fillStyle = 'rgba(255,255,255,0.74)';
+      vctx.font = `500 ${Math.round(27*s)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+      vctx.fillText(ar.toUpperCase(), x, y);
+      y -= 36*s;
+    }
+    if (t){
+      vctx.fillStyle = '#fff';
+      vctx.font = `700 ${Math.round(44*s)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+      vctx.fillText(t.toUpperCase(), x, y);
+    }
+    vctx.restore();
+  }
+  function drawNervHUD(a, now){
     const th = THEMES[+themeSel.value];
     const amber = th.hud;
     const s = H/1080;               // scale factor
@@ -2834,7 +2893,6 @@
       vctx.textAlign = 'left';
     }
     vctx.restore();
-    drawSafeArea(s);
   }
 
   // Instagram covers the bottom of a Reel with the caption, audio ticker and action
@@ -3130,6 +3188,24 @@
   safeBtn.addEventListener('click', () => { safe = !safe; reflectSafe(); });
   fpBtn.addEventListener('click', () => { fpMode = !fpMode; fpBtn.classList.toggle('primary', fpMode); });
   fpSaveBtn.addEventListener('click', fpSave);
+  hudBtn.addEventListener('click', () => {
+    hudOn = !hudOn;
+    hudBtn.classList.toggle('primary', hudOn);
+    hudBtn.textContent = hudOn ? '▣ HUD' : '▣ HUD: Off';
+  });
+  // One button that shows what the tool can do without reading anything. Density stays
+  // off the extremes -- a random pick that lands on 6 nodes or a blank field just reads
+  // as broken rather than as a different look.
+  randBtn.addEventListener('click', () => {
+    const modes = [...modeSel.options].map(o => o.value);
+    modeSel.value = modes[Math.random()*modes.length | 0];
+    modeSel.dispatchEvent(new Event('change'));
+    themeSel.value = String(Math.random()*THEMES.length | 0);
+    themeSel.dispatchEvent(new Event('change'));
+    nodeSlider.value = (0.30 + Math.random()*0.65).toFixed(2);
+    applySlider();
+    setTrails(Math.random() < 0.5);
+  });
   safeAreaBtn.addEventListener('click', () => {
     safeArea = !safeArea;
     safeAreaBtn.classList.toggle('primary', safeArea);
@@ -3152,12 +3228,13 @@
     clearTrails();                       // don't ghost the mode we just left
     applySlider();
   });
-  trailBtn.addEventListener('click', () => {
-    trailsOn = !trailsOn;
+  function setTrails(on){
+    trailsOn = on;
     trailBtn.classList.toggle('primary', trailsOn);
     trailBtn.textContent = trailsOn ? '✳ Trails' : '✳ Trails: Off';
     clearTrails();
-  });
+  }
+  trailBtn.addEventListener('click', () => setTrails(!trailsOn));
   // sync button to the OS-default calm state applied at boot
   try { if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) safe = true; } catch(e){}
   reflectSafe();
@@ -3217,6 +3294,9 @@
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
       if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
       if (P.has('guides')) safeArea = tp('guides',0) > 0.5;
+      if (P.has('hud'))    hudOn = tp('hud',1) > 0.5;
+      if (P.has('title'))  titleIn.value  = P.get('title');
+      if (P.has('artist')) artistIn.value = P.get('artist');
       const th = THEMES[Math.max(0, Math.min(THEMES.length-1, tp('theme',0)|0))];
       themeSel.value = String(THEMES.indexOf(th));
       safe  = tp('safe',0) > 0.5;
