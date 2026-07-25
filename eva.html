@@ -127,6 +127,12 @@
     </div>
     <div class="sep"></div>
     <div class="group">
+      <label class="field">Engine
+        <select id="modeSel">
+          <option value="web">🧠 Neural Web</option>
+          <option value="nebula">✦ Particle Nebula</option>
+        </select>
+      </label>
       <label class="field">Unit
         <select id="themeSel">
           <option value="0">01 · NERV Amber</option>
@@ -144,7 +150,7 @@
         </select>
       </label>
       <button id="netBtn" class="primary">🧠 Neural</button>
-      <label class="field">Nodes <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.8"></label>
+      <label class="field"><span id="nodeLbl">Nodes</span> <input type="range" id="nodeSlider" min="0" max="1" step="0.01" value="0.8"></label>
       <button id="safeBtn" title="Reduce flashing & motion">🕊 Calm</button>
     </div>
     <div class="sep"></div>
@@ -181,6 +187,8 @@
   const micBtn    = document.getElementById('micBtn');
   const playBtn   = document.getElementById('playBtn');
   const themeSel  = document.getElementById('themeSel');
+  const modeSel   = document.getElementById('modeSel');
+  const nodeLbl   = document.getElementById('nodeLbl');
   const ratioSel  = document.getElementById('ratioSel');
   const recBtn    = document.getElementById('recBtn');
   const recDot    = document.getElementById('recDot');
@@ -289,16 +297,44 @@
     H = 1080; W = Math.round(1080*rw/rh);          // GPU handles full 1080p
     glCanvas.width=W; glCanvas.height=H;
     view.width=W; view.height=H;
-    if (gl) gl.viewport(0,0,W,H);
+    if (gl) allocRTs(Math.round(W*renderScale), Math.round(H*renderScale));
   }
 
-  // ---------------- WebGL2 renderer ----------------
-  let gl=null, prog=null, fftTex=null, uni={};
+  // ---------------- WebGL2 engine ----------------
+  // Multi-pass pipeline:
+  //   1. the active MODE draws the hero visual into sceneRT (HDR when float RTs exist)
+  //   2. bright-pass -> two octaves of separable blur  = real, thresholded bloom
+  //   3. composite: chromatic aberration + bloom + ACES tonemap + CRT grade -> canvas
+  // Only step 1 changes when a mode is added, so new hero visuals are cheap to build.
+  // The old fake bloom (col += col*col) lifted EVERYTHING to buy glow, which is why
+  // loud passages blew out; a thresholded bright-pass + filmic rolloff gives the glow
+  // back without the white-out.
+  let gl=null, fftTex=null, quadVAO=null;
+  const uCache = new Map();
+  function U(p, n){                    // cached uniform lookup (null locations no-op)
+    let m = uCache.get(p);
+    if (!m){ m = new Map(); uCache.set(p, m); }
+    if (!m.has(n)) m.set(n, gl.getUniformLocation(p, n));
+    return m.get(n);
+  }
+
+  // shared GLSL helpers, injected into every program
+  const COMMON = `
+  // rotate a color around the value axis -> vivid hue shimmer
+  vec3 hueShift(vec3 c, float a){
+    const vec3 k = vec3(0.57735);
+    float cs = cos(a), sn = sin(a);
+    return c*cs + cross(k,c)*sn + k*dot(k,c)*(1.0-cs);
+  }
+  float h11(float p){ return fract(sin(p*127.1)*43758.5453); }
+  float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+  `;
+
   const VERT = `#version 300 es
-  in vec2 a_pos;
+  layout(location=0) in vec2 a_pos;
   void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }`;
 
-  const FRAG = `#version 300 es
+  const FRAG_WEB = `#version 300 es
   precision highp float;
   out vec4 fragColor;
   uniform vec2  u_res;
@@ -326,6 +362,7 @@
   uniform int   u_figN;         // active outline point count (0 = no figure)
   uniform vec3  u_figA;         // figure body color
   uniform vec3  u_figB;         // figure rim / accent color
+  ${COMMON}
 
   float hexDist(vec2 p){ p = abs(p); return max(dot(p, vec2(0.866025,0.5)), p.y); }
   vec4 hexCoords(vec2 uv){
@@ -340,12 +377,6 @@
   }
   float fftAt(float t){ return texture(u_fft, vec2(clamp(t,0.0,1.0), 0.5)).r; }
 
-  // rotate a color around the value axis -> vivid hue shimmer
-  vec3 hueShift(vec3 c, float a){
-    const vec3 k = vec3(0.57735);
-    float cs = cos(a), sn = sin(a);
-    return c*cs + cross(k,c)*sn + k*dot(k,c)*(1.0-cs);
-  }
   // anime "speed lines" radiating from center, strongest at the edges
   float speedLines(vec2 uv, float t){
     float a = atan(uv.y, uv.x);
@@ -480,15 +511,22 @@
     float iris  = 0.5 + 0.5*sin(d*46.0 - t*2.2);
     vec3 coreCol = mix(u_c1, vec3(1.0,0.92,0.72), core);
     col += coreCol * (core * (0.85 + iris*0.35));
-    col += u_c1 * smoothstep(coreR*4.5, 0.0, d) * (0.35 + u_bass*0.5); // bloom halo
+    // Halo radius is CAPPED. It used to be coreR*4.5, and coreR grows with bass -- at a
+    // loud passage that reached ~1.1uv, i.e. the whole frame, and washed everything out.
+    // Real bloom in the post chain gives the glow now; this is just the core's own falloff.
+    col += u_c1 * smoothstep(0.16 + u_bass*0.10, 0.0, d) * (0.24 + u_bass*0.22);
     // rotating targeting ring
     float ring = smoothstep(0.006, 0.0, abs(d - (coreR*2.2)));
     col += u_c1 * ring * (0.4 + u_treble);
 
-    // --- cruciform light burst on beat (bigger, brighter) ---
-    float cross = exp(-abs(uv.x)*16.0) + exp(-abs(uv.y)*16.0);
-    cross += 0.5*(exp(-abs(uv.x)*5.0) + exp(-abs(uv.y)*5.0)); // wide bloom arms
-    col += mix(u_c1, vec3(1.0,0.95,0.85), 0.6) * cross * u_beat * (0.4 + 0.9*u_safe);
+    // --- cruciform light burst on beat ---
+    // The wide arms used to decay as exp(-|x|*5), which is still ~0.2 at the frame edge,
+    // so on every beat the whole frame lifted and the cross read as a white blob instead
+    // of a cross. Faster falloff + a radial gate keeps it a SHAPE; post bloom does the glow.
+    float cross = exp(-abs(uv.x)*22.0) + exp(-abs(uv.y)*22.0);
+    cross += 0.35*(exp(-abs(uv.x)*9.0) + exp(-abs(uv.y)*9.0));
+    cross *= smoothstep(0.95, 0.08, length(uv));
+    col += mix(u_c1, vec3(1.0,0.95,0.85), 0.6) * cross * u_beat * (0.25 + 0.5*u_safe);
 
     return col;
   }
@@ -504,19 +542,14 @@
     // brief shake -- beat*beat so only the heavy hits shake, soft ticks barely move
     uv += vec2(sin(t*133.0), cos(t*149.0)) * (u_beat*u_beat*0.012) * u_safe;
 
-    // chromatic aberration (base always on; beat surge gated by safe mode)
-    float ca = 0.004 + u_beat*0.018*u_safe;
-    vec2 dir = normalize(uv + 1e-5);
     // busy background scene -> compensated by auto-exposure so loud passages settle
     // slow continuous drift so the background is always gently rotating; the
     // neural web stays in screen space (its figures spin under their own control).
+    // (chromatic aberration used to evaluate scene() three times here; it now runs
+    //  once in the composite pass -- same look, a third of the background cost.)
     float gr = t*0.035 + u_bass*0.15;
     mat2 grot = mat2(cos(gr),-sin(gr),sin(gr),cos(gr));
-    vec2 buv = grot * uv;
-    vec3 scn;
-    scn.r = scene(buv + dir*ca, t).r;
-    scn.g = scene(buv,          t).g;
-    scn.b = scene(buv - dir*ca, t).b;
+    vec3 scn = scene(grot * uv, t);
     float sl = speedLines(uv, t) * (u_beat*1.4 + u_treble*0.4) * u_safe;
     scn += mix(u_c1, vec3(1.0), 0.6) * sl;
     scn *= u_exposure;
@@ -526,21 +559,266 @@
     vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.5) * (1.0 - u_coh*0.30);
     net *= (1.0 + u_coil*0.18 + u_burst*0.30);         // tension glows; release flashes (restrained)
     vec3 fig = figure(uv, t);
-    vec3 col = scn + net + fig;
+    // HDR out: the grade (bloom, tonemap, scanlines, vignette) lives in the post pass
+    fragColor = vec4(scn + net + fig, 1.0);
+  }`;
 
-    // ---- VIVID grade (Testify / anime pop) ----
-    col += col*col*0.28;                                    // HDR bloom lift (restrained so highlights don't blow)
+  // ---- nebula backdrop: dark drifting gas the particles hang inside ----
+  // Deliberately DIM. Same lesson as the coalesced shapes: the hero (here, the
+  // particles) has to dominate, so this is atmosphere and never a subject.
+  const FRAG_GAS = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  uniform vec2  u_res;
+  uniform float u_time, u_bass, u_mid, u_treble, u_beat, u_coil, u_burst, u_safe, u_exposure;
+  uniform vec3  u_c1, u_c2;
+  ${COMMON}
+  float vn(vec3 p){                       // cheap 3D value noise
+    vec3 i = floor(p), f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    float n = i.x + i.y*57.0 + i.z*113.0;
+    float a = mix(h11(n),      h11(n+1.0),   f.x);
+    float b = mix(h11(n+57.0), h11(n+58.0),  f.x);
+    float c = mix(h11(n+113.0),h11(n+114.0), f.x);
+    float d = mix(h11(n+170.0),h11(n+171.0), f.x);
+    return mix(mix(a,b,f.y), mix(c,d,f.y), f.z);
+  }
+  float fbm(vec3 p){
+    float s = 0.0, a = 0.5;
+    for (int i=0;i<4;i++){ s += a*vn(p); p *= 2.03; a *= 0.5; }
+    return s;
+  }
+  void main(){
+    vec2 uv = (gl_FragCoord.xy - 0.5*u_res) / u_res.y;
+    float t = u_time;
+    float d = length(uv);
+    // domain-warped clouds, slowly boiling; the churn speeds up with the mids.
+    // (keep the frequency up -- at low frequency a 9:16 frame only sees one lobe of
+    //  the noise and it reads as a smeared band rather than cloud texture.)
+    vec3 q = vec3(uv*3.4, t*0.045);
+    float w = fbm(q*0.8 + vec3(0.0,0.0,t*0.02));
+    float cl = fbm(q + w*(0.7 + u_mid*0.8));
+    cl = pow(max(cl-0.28, 0.0), 1.7);
+    vec3 col = mix(u_c2, u_c1, cl*1.4) * cl * (0.30 + u_bass*0.55 + u_burst*0.5);
+    col = hueShift(col, w*0.5 + t*0.05);
+    // starfield: sparse, steady, gives the depth a reference frame
+    vec2 sp = floor(uv*260.0);
+    float st = step(0.9975, h21(sp));
+    col += vec3(0.7,0.8,1.0) * st * (0.35 + 0.4*sin(t*2.0 + h21(sp)*40.0)) * 0.7;
+    // the singularity the cloud orbits: swells on bass, flares on the release.
+    // Restrained on purpose -- it sits dead centre, so any excess reads as a white blob.
+    float coreR = 0.032 + u_bass*0.045 + u_burst*0.04;
+    col += mix(u_c1, vec3(1.0,0.93,0.78), 0.5) * smoothstep(coreR, 0.0, d) * (0.55 + u_beat*0.35);
+    col += u_c1 * smoothstep(coreR*8.0, 0.0, d) * (0.10 + u_bass*0.22 + u_coil*0.20);
+    col *= smoothstep(1.45, 0.25, d);                 // hold the frame's edges dark
+    fragColor = vec4(col * u_exposure, 1.0);
+  }`;
+
+  // ---- particle nebula: transform-feedback sim (runs with the rasterizer off) ----
+  // Divergence-free curl flow from an ANALYTIC vector potential: six trig ops instead
+  // of ~18 noise lookups per particle, which is what makes 100k+ particles affordable.
+  const VERT_SIM = `#version 300 es
+  precision highp float;
+  layout(location=0) in vec3 a_pos;
+  layout(location=1) in vec3 a_vel;
+  layout(location=2) in vec3 a_dat;      // x = life 1..0, y = seed, z = fft band
+  out vec3 v_pos; out vec3 v_vel; out vec3 v_dat;
+  uniform float u_dt, u_time, u_bass, u_mid, u_treble, u_beat, u_coil, u_burst, u_safe;
+  uniform float u_shell, u_flow, u_swirl;
+  uniform vec4  u_mouse;                 // xyz = cursor in WORLD space, w: 0 none/1 drag/2 hover
+  uniform sampler2D u_fft;
+  ${COMMON}
+  vec3 hash33(vec3 p){
+    p = vec3(dot(p,vec3(127.1,311.7,74.7)), dot(p,vec3(269.5,183.3,246.1)), dot(p,vec3(113.5,271.9,124.6)));
+    return fract(sin(p)*43758.5453);
+  }
+  // curl of psi = (sin(a.y)+cos(b.z), sin(c.z)+cos(d.x), sin(e.x)+cos(f.y))
+  vec3 curlField(vec3 p, float t){
+    vec3 q = p + vec3(0.0, 0.0, t*0.25);
+    vec3 c1 = vec3(-1.6*sin(1.6*q.y) - 1.5*cos(1.5*q.z),
+                   -1.3*sin(1.3*q.z) - 1.4*cos(1.4*q.x),
+                   -1.9*sin(1.9*q.x) - 1.7*cos(1.7*q.y));
+    vec3 r = q*2.7 + 4.1;                                   // second octave = fine eddies
+    vec3 c2 = vec3(-1.6*sin(1.6*r.y) - 1.5*cos(1.5*r.z),
+                   -1.3*sin(1.3*r.z) - 1.4*cos(1.4*r.x),
+                   -1.9*sin(1.9*r.x) - 1.7*cos(1.7*r.y));
+    return c1 + c2*0.4;
+  }
+  void main(){
+    vec3 pos = a_pos, vel = a_vel;
+    float life = a_dat.x, seed = a_dat.y, band = a_dat.z;
+    float dt = u_dt;
+    float e = texture(u_fft, vec2(band, 0.5)).r;            // this particle's own frequency
+    float r = length(pos);
+    vec3 dir = pos / max(r, 1e-4);
+
+    vec3 acc = curlField(pos*u_flow, u_time) * (0.9 + u_mid*2.6 + e*1.8);
+    // galactic rotation: tangential push about a slightly tilted axis, stronger inside
+    vec3 tang = normalize(cross(pos, vec3(0.0, 1.0, 0.18)) + vec3(1e-5));
+    acc += tang * u_swirl / (0.35 + r);
+    // the cloud breathes: each particle seeks its OWN radius (spread by its seed), so
+    // the nebula fills a VOLUME. One shared radius makes every particle chase the same
+    // sphere and the whole thing renders as a hollow rugby ball.
+    // cube-root radius: a UNIFORM seed puts density ~1/r^2, piling particles into the
+    // middle where they all overlap and saturate. seed^(1/3) is the distribution that
+    // fills a sphere evenly, which is what makes the cloud read as volume, not a lamp.
+    float rTarget = u_shell * (0.20 + 1.35*pow(seed, 0.34));
+    acc -= dir * (r - rTarget) * 2.2;                        // soft spring: the flow still wins
+    // beats punch it outward, the drop detonates it
+    acc += dir * (u_beat*u_beat*7.0 + u_burst*15.0 + e*1.6) * u_safe;
+    // cursor: drag hauls the cloud in, hover shoulders it aside (matches the web).
+    // JS un-rotates the cursor by the camera yaw first, so this is a real world-space
+    // point under the pointer -- comparing screen xy to world xy drifts as the camera turns.
+    if (u_mouse.w > 0.5){
+      bool drag = u_mouse.w < 1.5;
+      vec3 dl = u_mouse.xyz - pos;
+      float dd = length(dl) + 1e-4;
+      float infl = smoothstep(0.9, 0.0, dd);
+      acc += (drag ? dl/dd : -dl/dd) * infl * (drag ? 9.0 : 5.0);
+    }
+    vel += acc*dt;
+    vel *= exp(-dt*1.7);                                    // drag, so it settles instead of exploding
+    pos += vel*dt;
+
+    life -= dt * (0.09 + seed*0.10);
+    if (life <= 0.0 || r > 3.4){                            // recycle: reseed near the shell
+      vec3 h = hash33(vec3(seed*97.3, u_time, float(gl_VertexID)*0.017));
+      float th = h.x*6.2831853, ph = acos(2.0*h.y - 1.0);
+      vec3 nd = vec3(sin(ph)*cos(th), cos(ph)*0.75, sin(ph)*sin(th));
+      pos = nd * rTarget * (0.5 + h.z*0.8);
+      vel = normalize(cross(pos, vec3(0.0,1.0,0.18)) + vec3(1e-5)) * (0.25 + h.z*0.4);
+      life = 1.0;
+    }
+    v_pos = pos; v_vel = vel; v_dat = vec3(life, seed, band);
+  }`;
+  const FRAG_SIM = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  void main(){ fragColor = vec4(0.0); }`;
+
+  // ---- particle nebula: additive point-sprite render, real perspective ----
+  const VERT_PTS = `#version 300 es
+  precision highp float;
+  layout(location=0) in vec3 a_pos;
+  layout(location=1) in vec3 a_vel;
+  layout(location=2) in vec3 a_dat;
+  out vec4 v_col;
+  uniform vec2  u_res;
+  uniform float u_time, u_bass, u_beat, u_burst, u_coil, u_safe, u_hue;
+  uniform float u_cam, u_focal, u_psize, u_exposure;
+  uniform vec3  u_c1, u_c2;
+  uniform sampler2D u_fft;
+  ${COMMON}
+  void main(){
+    // camera: a slow drift around the cloud, tilted, pulled in by heavy beats
+    float yaw = u_time*0.075 + u_bass*0.22;
+    float cy = cos(yaw), sy = sin(yaw);
+    vec3 p = vec3(a_pos.x*cy + a_pos.z*sy, a_pos.y, -a_pos.x*sy + a_pos.z*cy);
+    // pitch matters more than it looks: near edge-on the disc projects to a thin ellipse
+    // and every particle overlaps every other one, which saturates to a white smear
+    float pit = 0.50 + sin(u_time*0.11)*0.12;
+    float cp = cos(pit), sp = sin(pit);
+    p = vec3(p.x, p.y*cp - p.z*sp, p.y*sp + p.z*cp);
+    float z = max(p.z + u_cam, 0.08);
+    float f = u_focal / z;
+    gl_Position = vec4(p.x*f*(u_res.y/u_res.x), p.y*f, 0.0, 1.0);
+
+    float e = texture(u_fft, vec2(a_dat.z, 0.5)).r;
+    float spd = length(a_vel);
+    float life = a_dat.x;
+    float fade = smoothstep(0.0, 0.14, life) * smoothstep(1.0, 0.86, life);
+    // size and brightness both track energy, so they multiply -- keep each modest or a
+    // loud passage saturates into one white ellipse
+    gl_PointSize = clamp(u_psize * f * (0.45 + e*0.9 + u_beat*0.30*u_safe), 1.0, 42.0);
+
+    vec3 col = mix(u_c2, u_c1, clamp(e*1.6 + spd*0.30, 0.0, 1.0));
+    col = hueShift(col, u_hue + spd*0.22 + a_dat.y*0.25);
+    col += vec3(1.0,0.94,0.82) * smoothstep(1.1, 2.8, spd) * 0.7;      // hot fast streaks
+    float depth = smoothstep(7.0, 1.0, z);                             // far particles recede
+    // per-particle brightness stays LOW: with 100k+ additive sprites the image is built
+    // by accumulation, and anything per-sprite gets multiplied by the overlap count.
+    v_col = vec4(col * (0.08 + e*0.38 + u_burst*0.25 + u_coil*0.10), fade*depth*u_exposure);
+  }`;
+  const FRAG_PTS = `#version 300 es
+  precision highp float;
+  in vec4 v_col;
+  out vec4 fragColor;
+  void main(){
+    vec2 d = gl_PointCoord - 0.5;
+    float r2 = dot(d,d)*4.0;
+    if (r2 > 1.0) discard;
+    fragColor = vec4(v_col.rgb * exp(-r2*3.0) * v_col.a, 1.0);   // premultiplied, blend = ONE/ONE
+  }`;
+
+  // ---- post chain ----
+  const FRAG_BRIGHT = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  uniform sampler2D u_src;
+  uniform vec2  u_dstTexel;   // 1/dest size: gl_FragCoord is in DEST space, and the
+  uniform vec2  u_srcTexel;   // dest is half-res, so uv must not use the source texel
+  uniform float u_thr, u_knee;
+  void main(){
+    vec2 uv = gl_FragCoord.xy * u_dstTexel;
+    // 4-tap box downsample first -> a stable bright-pass instead of a sparkling one
+    vec3 c = texture(u_src, uv + u_srcTexel*vec2( 0.5, 0.5)).rgb
+           + texture(u_src, uv + u_srcTexel*vec2(-0.5, 0.5)).rgb
+           + texture(u_src, uv + u_srcTexel*vec2( 0.5,-0.5)).rgb
+           + texture(u_src, uv + u_srcTexel*vec2(-0.5,-0.5)).rgb;
+    c *= 0.25;
+    float l = max(c.r, max(c.g, c.b));
+    fragColor = vec4(c * smoothstep(u_thr, u_thr + u_knee, l), 1.0);
+  }`;
+  const FRAG_BLUR = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  uniform sampler2D u_src;
+  uniform vec2 u_texel;    // 1/size
+  uniform vec2 u_dir;      // (1,0) or (0,1), scaled by radius
+  void main(){
+    vec2 uv = gl_FragCoord.xy * u_texel;
+    vec2 o1 = u_dir * u_texel * 1.3846153846;   // linear-sampled 9-tap gaussian
+    vec2 o2 = u_dir * u_texel * 3.2307692308;
+    vec3 c = texture(u_src, uv).rgb * 0.2270270270;
+    c += (texture(u_src, uv+o1).rgb + texture(u_src, uv-o1).rgb) * 0.3162162162;
+    c += (texture(u_src, uv+o2).rgb + texture(u_src, uv-o2).rgb) * 0.0702702703;
+    fragColor = vec4(c, 1.0);
+  }`;
+  const FRAG_POST = `#version 300 es
+  precision highp float;
+  out vec4 fragColor;
+  uniform sampler2D u_scene, u_bloom1, u_bloom2;
+  uniform vec2  u_res;
+  uniform float u_time, u_beat, u_safe, u_bloomAmt, u_ca, u_sat;
+  ${COMMON}
+  // ACES filmic curve: rolls highlights off instead of clipping them to white, which
+  // is what finally lets the scene be bright WITHOUT blowing out.
+  vec3 aces(vec3 x){
+    return clamp((x*(2.51*x + 0.03)) / (x*(2.43*x + 0.59) + 0.14), 0.0, 1.0);
+  }
+  void main(){
+    vec2 uv = gl_FragCoord.xy / u_res;
+    vec2 c  = uv - 0.5;
+    vec2 dir = normalize(c + vec2(1e-5));
+    // chromatic aberration, now one cheap texture fetch per channel (was 3x the scene)
+    float ca = u_ca * (0.0018 + u_beat*0.010*u_safe) * (0.25 + length(c)*1.7);
+    vec3 col = vec3(texture(u_scene, uv + dir*ca).r,
+                    texture(u_scene, uv).g,
+                    texture(u_scene, uv - dir*ca).b);
+    col += (texture(u_bloom1, uv).rgb + texture(u_bloom2, uv).rgb*0.65) * u_bloomAmt;
+
     float l = dot(col, vec3(0.299,0.587,0.114));
-    col = mix(vec3(l), col, 1.5);                           // saturation punch
-    col = hueShift(col, sin(t*0.08)*0.10);                  // slow spectral shimmer
+    col = mix(vec3(l), col, u_sat);                         // saturation punch
+    col = hueShift(col, sin(u_time*0.08)*0.10);             // slow spectral shimmer
+    col = aces(col);
+    col = pow(col, vec3(0.92));                             // small lift back into the mids
 
-    // CRT scanlines + flicker
-    col *= 0.86 + 0.14*sin(gl_FragCoord.y*2.2);
-    col *= 0.96 + 0.04*sin(t*48.0)*u_safe;                  // flicker (off in calm mode)
-    col *= smoothstep(1.5, 0.3, length(uv));                // vignette
-    col += vec3(1.0) * u_beat * 0.10 * u_safe;              // transient beat pop (gated)
-    col = pow(max(col, 0.0), vec3(0.80));                   // punchier contrast
-    fragColor = vec4(col, 1.0);
+    col *= 0.86 + 0.14*sin(gl_FragCoord.y*2.2);             // CRT scanlines
+    col *= 0.96 + 0.04*sin(u_time*48.0)*u_safe;             // flicker (off in calm mode)
+    col *= smoothstep(1.35, 0.28, length(c)*2.0);           // vignette
+    col += vec3(1.0) * u_beat * 0.06 * u_safe;              // transient beat pop (gated)
+    col += (h21(uv*u_res + fract(u_time)*311.0) - 0.5) * 0.018;   // grain: hides 8-bit banding
+    fragColor = vec4(max(col, 0.0), 1.0);
   }`;
 
   function compile(type, src){
@@ -549,26 +827,101 @@
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
     return s;
   }
+  function makeProg(vs, fs, tfVaryings){
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    if (tfVaryings) gl.transformFeedbackVaryings(p, tfVaryings, gl.SEPARATE_ATTRIBS);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return p;
+  }
+
+  // ---- render targets ----
+  let rtFmt = null, bloomThr = 1.0;       // {internal, type} chosen at init
+  let sceneRT = null, bloom1 = [null,null], bloom2 = [null,null];
+  let RW = 0, RH = 0;                     // current internal render size
+  function makeRT(w, h){
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, rtFmt.internal, w, h, 0, gl.RGBA, rtFmt.type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return ok ? {tex, fb, w, h} : null;
+  }
+  function freeRT(rt){ if (rt){ gl.deleteTexture(rt.tex); gl.deleteFramebuffer(rt.fb); } }
+  function allocRTs(w, h){
+    if (RW === w && RH === h && sceneRT) return;
+    RW = w; RH = h;
+    freeRT(sceneRT); for (const b of bloom1) freeRT(b); for (const b of bloom2) freeRT(b);
+    const hw = Math.max(2, w>>1), hh = Math.max(2, h>>1);
+    const qw = Math.max(2, w>>2), qh = Math.max(2, h>>2);
+    sceneRT  = makeRT(w, h);
+    bloom1[0] = makeRT(hw, hh); bloom1[1] = makeRT(hw, hh);
+    bloom2[0] = makeRT(qw, qh); bloom2[1] = makeRT(qw, qh);
+  }
+  // adaptive resolution: the internal render size tracks the measured frame time so a
+  // phone degrades gracefully instead of dropping to a slideshow. The HUD and the
+  // recorded canvas stay at full size -- only the shaded pixels shrink.
+  let renderScale = 1, frameMs = 16.7, scaleFrames = 0;
+  function adaptResolution(dt){
+    frameMs = frameMs*0.9 + Math.min(dt, 100)*0.1;
+    if (++scaleFrames < 45) return;
+    scaleFrames = 0;
+    const before = renderScale;
+    if (frameMs > 21.5)      renderScale = Math.max(0.50, renderScale - 0.10);
+    else if (frameMs < 17.0) renderScale = Math.min(1.00, renderScale + 0.05);
+    if (Math.abs(renderScale - before) > 1e-3) allocRTs(Math.round(W*renderScale), Math.round(H*renderScale));
+  }
+
+  function drawQuad(){ gl.bindVertexArray(quadVAO); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+  function bindRT(rt){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rt ? rt.fb : null);
+    gl.viewport(0, 0, rt ? rt.w : W, rt ? rt.h : H);
+  }
+
+  let progWeb=null, progGas=null, progSim=null, progPts=null, progBright=null, progBlur=null, progPost=null;
+  let nebulaOK = true;
   function createRenderer(){
-    gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer:true, antialias:true, alpha:false });
+    gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer:true, antialias:false, alpha:false });
     if (!gl) throw new Error('WebGL2 not supported in this browser.');
-    prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
-    gl.bindAttribLocation(prog, 0, 'a_pos');
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-    gl.useProgram(prog);
-    // fullscreen triangle
+    // float render targets keep the scene HDR so the bright-pass has real highlights
+    // to work with; without them everything clamps at 1.0 and bloom gets thin.
+    const hasFloat = !!gl.getExtension('EXT_color_buffer_float');
+    rtFmt = hasFloat ? {internal: gl.RGBA16F, type: gl.HALF_FLOAT} : {internal: gl.RGBA8, type: gl.UNSIGNED_BYTE};
+    allocRTs(W, H);
+    if (!sceneRT){                                   // float RTs advertised but unusable
+      rtFmt = {internal: gl.RGBA8, type: gl.UNSIGNED_BYTE};
+      RW = RH = 0; allocRTs(W, H);
+      if (!sceneRT) throw new Error('Could not create a render target.');
+    }
+    // with HDR targets real highlights live above 1.0, so the bright-pass can sit there;
+    // on the LDR fallback everything clamps at 1.0 and the threshold has to drop below it.
+    bloomThr = (rtFmt.type === gl.HALF_FLOAT) ? 1.0 : 0.72;
+
+    progWeb    = makeProg(VERT, FRAG_WEB);
+    progBright = makeProg(VERT, FRAG_BRIGHT);
+    progBlur   = makeProg(VERT, FRAG_BLUR);
+    progPost   = makeProg(VERT, FRAG_POST);
+
+    // fullscreen triangle (its own VAO, so particle attribute state never leaks in)
+    quadVAO = gl.createVertexArray();
+    gl.bindVertexArray(quadVAO);
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    // uniforms
-    for (const n of ['u_res','u_time','u_bass','u_mid','u_treble','u_beat','u_c1','u_c2','u_fft','u_nodes','u_edges','u_net','u_exposure','u_safe','u_coh','u_coil','u_burst','u_fig','u_figN','u_figA','u_figB'])
-      uni[n] = gl.getUniformLocation(prog, n);
-    // fft texture
+    gl.bindVertexArray(null);
+
+    // fft texture (unit 0 everywhere)
     const bins = analyser ? analyser.frequencyBinCount : 1024;
     fftTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, fftTex);
@@ -578,7 +931,73 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.uniform1i(uni.u_fft, 0);
+    // The nebula is built separately and allowed to FAIL: if a device chokes on the
+    // particle programs, the web mode still has to come up rather than taking the whole
+    // visualizer down with it.
+    try {
+      progGas = makeProg(VERT, FRAG_GAS);
+      progSim = makeProg(VERT_SIM, FRAG_SIM, ['v_pos','v_vel','v_dat']);
+      progPts = makeProg(VERT_PTS, FRAG_PTS);
+      initParticles(particleTarget());
+      for (const p of [progGas, progSim, progPts]){ gl.useProgram(p); gl.uniform1i(U(p,'u_fft'), 0); }
+    } catch(e) {
+      nebulaOK = false;
+      modeId = 'web';
+      const opt = modeSel.querySelector('option[value="nebula"]');
+      if (opt) opt.remove();
+      modeSel.value = 'web';
+    }
+    gl.useProgram(progWeb); gl.uniform1i(U(progWeb,'u_fft'), 0);
+  }
+
+  // ---- post: bright-pass -> 2 blurred octaves -> composite to the canvas ----
+  function blurInto(src, dst, dx, dy){
+    bindRT(dst);
+    gl.useProgram(progBlur);
+    gl.uniform1i(U(progBlur,'u_src'), 1);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform2f(U(progBlur,'u_texel'), 1/dst.w, 1/dst.h);
+    gl.uniform2f(U(progBlur,'u_dir'), dx, dy);
+    drawQuad();
+  }
+  function postProcess(S){
+    gl.disable(gl.BLEND);
+    // bright-pass into the half-res octave
+    bindRT(bloom1[0]);
+    gl.useProgram(progBright);
+    gl.uniform1i(U(progBright,'u_src'), 1);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex);
+    gl.uniform2f(U(progBright,'u_dstTexel'), 1/bloom1[0].w, 1/bloom1[0].h);
+    gl.uniform2f(U(progBright,'u_srcTexel'), 1/RW, 1/RH);
+    // threshold above the diffuse range so only genuine HIGHLIGHTS bloom. Set it low
+    // and the whole frame passes, gets smeared, and comes back as milk -- which is
+    // exactly the white-out this pipeline exists to kill.
+    gl.uniform1f(U(progBright,'u_thr'), bloomThr);
+    gl.uniform1f(U(progBright,'u_knee'), 0.7);
+    drawQuad();
+    blurInto(bloom1[0], bloom1[1], 1, 0);
+    blurInto(bloom1[1], bloom1[0], 0, 1);
+    // one wider octave at quarter res -> a soft halo, not a fog bank
+    blurInto(bloom1[0], bloom2[0], 1.5, 0);
+    blurInto(bloom2[0], bloom2[1], 0, 1.5);
+
+    bindRT(null);
+    gl.useProgram(progPost);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, bloom1[0].tex);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, bloom2[1].tex);
+    gl.uniform1i(U(progPost,'u_scene'), 1);
+    gl.uniform1i(U(progPost,'u_bloom1'), 2);
+    gl.uniform1i(U(progPost,'u_bloom2'), 3);
+    gl.uniform2f(U(progPost,'u_res'), W, H);
+    gl.uniform1f(U(progPost,'u_time'), S.t);
+    gl.uniform1f(U(progPost,'u_beat'), S.beat);
+    gl.uniform1f(U(progPost,'u_safe'), S.safe);
+    gl.uniform1f(U(progPost,'u_bloomAmt'), S.safe < 0.5 ? 0.26 : 0.42);
+    gl.uniform1f(U(progPost,'u_ca'), 1.0);
+    gl.uniform1f(U(progPost,'u_sat'), 1.45);
+    drawQuad();
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   // ---------------- Analysis helpers ----------------
@@ -606,7 +1025,127 @@
   // calm mode: dampens flashing/strobe/punch (feeds u_safe). Default honors the OS setting.
   let safe = false;
   function safeVal(){ return safe ? 0.2 : 1.0; }
-  function analyze(now){
+
+  // ---- deeper listening: onsets, tempo, key ----------------------------------
+  // The bass-only detector could REACT but never ANTICIPATE, and it went nearly deaf
+  // on tracks without a kick. Spectral flux gives broadband onsets; autocorrelating
+  // the onset envelope over ~6s gives a tempo and a phase, so the visuals can sit on
+  // the grid instead of chasing it. Chroma gives the key, which drifts the palette.
+  const FLUX_N = 384;                       // ~6.4s of onset envelope at 60Hz
+  const fluxHist = new Float32Array(FLUX_N);
+  const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+  let prevSpec = null, fluxHead = 0, fluxPeak = 0, fluxT = 0;
+  let fluxMean = 0, fluxVar = 0, onset = 0, lastOnsetT = 0;
+  let bpm = 0, bpmConf = 0, beatPeriod = 0, beatPhase = 0, beatCount = 0, barPhase = 0, tempoT = 0;
+  const chroma = new Float32Array(12), chromaAcc = new Float32Array(12);
+  let chromaBins = null, keyIdx = -1, keyConf = 0, harmHue = 0, hueX = 1, hueY = 0;
+
+  function buildChromaBins(){
+    const sr = (audioCtx && audioCtx.sampleRate) || 44100;
+    const n = analyser ? analyser.fftSize : 2048;
+    chromaBins = new Int8Array(freqData.length).fill(-1);
+    for (let i=1;i<freqData.length;i++){
+      const f = i*sr/n;
+      if (f < 65 || f > 2100) continue;          // fundamental range; above it is mostly noise
+      const midi = 69 + 12*Math.log2(f/440);
+      chromaBins[i] = ((Math.round(midi) % 12) + 12) % 12;
+    }
+  }
+  // sum of positive bin-to-bin change = energy ARRIVING, which is what an onset is.
+  function spectralFlux(){
+    if (!prevSpec) prevSpec = new Float32Array(freqData.length);
+    let f = 0;
+    for (let i=2;i<400 && i<freqData.length;i++){
+      const v = freqData[i]/255, d = v - prevSpec[i];
+      if (d > 0) f += d;
+      prevSpec[i] = v;
+    }
+    return Math.min(1.5, f/45);
+  }
+  // autocorrelate the onset envelope; the strongest lag in the 69-180 BPM band wins
+  function estimateTempo(){
+    let mean = 0;
+    for (let i=0;i<FLUX_N;i++) mean += fluxHist[i];
+    mean /= FLUX_N;
+    let best = 0, bestLag = 0, sum = 0, cnt = 0;
+    for (let lag=20; lag<=52; lag++){
+      let s = 0;
+      const n = FLUX_N - lag;
+      for (let i=0;i<n;i++){
+        s += (fluxHist[(fluxHead+i)%FLUX_N] - mean) * (fluxHist[(fluxHead+i+lag)%FLUX_N] - mean);
+      }
+      s /= n;
+      sum += s; cnt++;
+      if (s > best){ best = s; bestLag = lag; }
+    }
+    const avg = sum/Math.max(1,cnt);
+    bpmConf = avg > 1e-9 ? Math.min(1, (best/avg - 1)/2.5) : 0;
+    if (bestLag && bpmConf > 0.25){
+      const nb = 3600/bestLag;                      // lag is in 60Hz frames
+      // octave stability: don't let it flip between half- and double-time every pass
+      const alt = bpm > 0 && (Math.abs(nb - bpm*2) < 6 || Math.abs(nb - bpm/2) < 6);
+      const tgt = (alt && bpmConf < 0.6) ? bpm : nb;
+      bpm = bpm > 0 ? bpm + (tgt - bpm)*0.35 : tgt;
+      beatPeriod = 60/bpm;
+    }
+  }
+  function listen(now, dt){
+    if (!chromaBins) buildChromaBins();
+    if (!fluxT) fluxT = now;              // anchor the 60Hz grid to the first frame, or
+                                          // every frame would flush a backlog of samples
+    const flux = spectralFlux();
+    // adaptive threshold from the running mean/deviation of the flux itself
+    fluxMean = fluxMean*0.98 + flux*0.02;
+    fluxVar  = fluxVar*0.98 + Math.abs(flux-fluxMean)*0.02;
+    onset = 0;
+    if (flux > fluxMean + fluxVar*2.2 + 0.02 && now - lastOnsetT > 110){
+      onset = Math.min(1, (flux - fluxMean) / (fluxVar*3 + 0.05));
+      lastOnsetT = now;
+    }
+    // resample the envelope onto a fixed 60Hz grid so tempo math is frame-rate independent
+    fluxPeak = Math.max(fluxPeak, flux);
+    if (now - fluxT >= 16.667){
+      const steps = Math.min(6, Math.floor((now - fluxT)/16.667));
+      for (let s=0;s<steps;s++){ fluxHist[fluxHead] = fluxPeak; fluxHead = (fluxHead+1)%FLUX_N; fluxPeak *= 0.4; }
+      fluxT += steps*16.667;
+      fluxPeak = 0;
+    }
+    if (now - tempoT > 700){ tempoT = now; estimateTempo(); }
+    // run the beat grid forward, phase-locking to onsets that land near it
+    if (beatPeriod > 0){
+      beatPhase += dt/beatPeriod;
+      while (beatPhase >= 1){ beatPhase -= 1; beatCount = (beatCount+1) % 4; }
+      if (onset > 0.3){
+        const err = beatPhase > 0.5 ? beatPhase - 1 : beatPhase;   // signed, ±0.5
+        beatPhase -= err * 0.18 * bpmConf;
+        if (beatPhase < 0){ beatPhase += 1; beatCount = (beatCount+3) % 4; }
+      }
+      barPhase = (beatCount + beatPhase)/4;
+    }
+    // chroma -> key -> a bounded hue drift, so the palette follows the harmony
+    chromaAcc.fill(0);
+    for (let i=1;i<freqData.length;i++){
+      const pc = chromaBins[i];
+      if (pc >= 0) chromaAcc[pc] += freqData[i]/255;
+    }
+    let cmax = 0, cidx = -1, csum = 0;
+    for (let p=0;p<12;p++){
+      chroma[p] = chroma[p]*0.94 + chromaAcc[p]*0.06;
+      csum += chroma[p];
+      if (chroma[p] > cmax){ cmax = chroma[p]; cidx = p; }
+    }
+    keyConf = csum > 1e-4 ? Math.min(1, (cmax/(csum/12) - 1)/1.6) : 0;
+    if (cidx >= 0 && keyConf > 0.15){
+      keyIdx = cidx;
+      const a = cidx*Math.PI/6;                      // circular EMA: no wrap-around jumps
+      hueX = hueX*0.985 + Math.cos(a)*0.015;
+      hueY = hueY*0.985 + Math.sin(a)*0.015;
+    }
+    harmHue = Math.atan2(hueY, hueX) * 0.28 * Math.min(1, keyConf*1.5);
+    return onset;
+  }
+
+  function analyze(now, dt){
     // reactive gain (AGC): normalize the input so quiet & loud tracks read the same,
     // with no user control. Replaces the old manual "Sync" slider (which over-drove
     // the scene into an unreadable white-out).
@@ -618,6 +1157,7 @@
     const bass = Math.min(rawB*g, 1.4);
     const mid  = Math.min(rawM*g, 1.4);
     const treb = Math.min(rawT*g, 1.4);
+    const on = listen(now, dt);
     bassSmooth = bassSmooth*0.92 + bass*0.08;
     if (bass > bassSmooth*1.28 && bass > 0.30 && now-lastBeat>150) {
       // the beat carries its STRENGTH: a profound kick punches far above the running
@@ -626,6 +1166,9 @@
       beat = Math.max(beat, 0.4 + strength*0.85);   // ~0.4 (soft) .. ~1.25 (profound)
       lastBeat = now;
     }
+    // broadband onsets (snares, claps, stabs) count as hits too -- a track with no
+    // kick drum used to leave the whole scene nearly still.
+    if (on > 0.35 && now-lastBeat > 110){ beat = Math.max(beat, 0.35 + on*0.55); lastBeat = now; }
     beat *= 0.88;
     const energy = (bass*0.6+mid*0.3+treb*0.1);
     // ---- breathing (in / out) ----
@@ -657,7 +1200,7 @@
   let figN = 0;                               // active outline points this frame
   const figA = new Float32Array(3), figB = new Float32Array(3);  // body / rim color
   let currentN = 0;                            // active node count (scalable)
-  let netNodes = [], netEdges = [], netOn = true, lastNetT = performance.now();
+  let netNodes = [], netEdges = [], netOn = true;
   // pointer/drag influence on the neural web (uv-space cursor position)
   const mouse = { x: 0, y: 0, down: false, over: false };
   function initNet(N){
@@ -834,19 +1377,206 @@
     figA[0]=shp.a[0]; figA[1]=shp.a[1]; figA[2]=shp.a[2];
     figB[0]=shp.b[0]; figB[1]=shp.b[1]; figB[2]=shp.b[2];
   }
-  function applyNet(now){
-    const dt = Math.min((now-lastNetT)/1000, 0.05); lastNetT = now;
-    updateNet(dt, inputGain);
-    gl.uniform3fv(uni.u_nodes, nodeBuf);
-    gl.uniform4fv(uni.u_edges, edgeBuf);
-    gl.uniform1f(uni.u_net, netOn ? 1 : 0);
-    gl.uniform1f(uni.u_coh, netOn ? coh : 0);
-    gl.uniform1f(uni.u_coil, coil);
-    gl.uniform1f(uni.u_burst, burst);
-    gl.uniform2fv(uni.u_fig, figBuf);
-    gl.uniform1i(uni.u_figN, figN);
-    gl.uniform3fv(uni.u_figA, figA);
-    gl.uniform3fv(uni.u_figB, figB);
+  // ---------------- GPU particle nebula ----------------
+  // Positions/velocities live entirely on the GPU and are advanced by transform
+  // feedback: the sim vertex shader reads buffer set A and writes buffer set B, then
+  // the sets swap. Nothing about the particles ever crosses back to JS.
+  const PMAX = 240000;
+  let pbuf = [null,null], pVAO = [null,null], tfo = null, pcur = 0;
+  let PCOUNT = 0, pActive = 0, pDensity = 0.8;
+  function particleTarget(){
+    let coarse = false;
+    try { coarse = matchMedia('(pointer:coarse)').matches; } catch(e){}
+    const cores = navigator.hardwareConcurrency || 4;
+    return Math.min(PMAX, coarse ? 45000 : (cores >= 8 ? 160000 : 90000));
+  }
+  function makeAttrBuf(data){
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_COPY);
+    return b;
+  }
+  function initParticles(n){
+    PCOUNT = Math.max(1000, Math.min(PMAX, n|0));
+    pActive = Math.round(PCOUNT * (0.25 + pDensity*0.75));
+    const pos = new Float32Array(PCOUNT*3), vel = new Float32Array(PCOUNT*3), dat = new Float32Array(PCOUNT*3);
+    for (let i=0;i<PCOUNT;i++){
+      const th = Math.random()*Math.PI*2, ph = Math.acos(2*Math.random()-1);
+      const rad = 0.20 + Math.pow(Math.random(), 0.34)*0.95;   // even fill, see rTarget
+      pos[i*3]   = Math.sin(ph)*Math.cos(th)*rad;
+      pos[i*3+1] = Math.cos(ph)*rad*0.75;          // slightly squashed -> a thick disc
+      pos[i*3+2] = Math.sin(ph)*Math.sin(th)*rad;
+      vel[i*3]   = (Math.random()-0.5)*0.2;
+      vel[i*3+1] = (Math.random()-0.5)*0.1;
+      vel[i*3+2] = (Math.random()-0.5)*0.2;
+      dat[i*3]   = Math.random();                  // life, staggered so respawns spread out
+      dat[i*3+1] = Math.random();                  // seed
+      // fft coordinate, bass-weighted: most of the cloud rides the low end, a thin
+      // upper population sparkles on hats/air (matches how the web picks its bands)
+      dat[i*3+2] = 0.002 + Math.pow(Math.random(), 1.8)*0.22;
+    }
+    for (let s=0;s<2;s++){
+      if (pbuf[s]) for (const b of Object.values(pbuf[s])) gl.deleteBuffer(b);
+      if (pVAO[s]) gl.deleteVertexArray(pVAO[s]);
+      pbuf[s] = { pos: makeAttrBuf(pos), vel: makeAttrBuf(vel), dat: makeAttrBuf(dat) };
+      pVAO[s] = gl.createVertexArray();
+      gl.bindVertexArray(pVAO[s]);
+      const attrs = [pbuf[s].pos, pbuf[s].vel, pbuf[s].dat];
+      for (let a=0;a<3;a++){
+        gl.bindBuffer(gl.ARRAY_BUFFER, attrs[a]);
+        gl.enableVertexAttribArray(a);
+        gl.vertexAttribPointer(a, 3, gl.FLOAT, false, 0, 0);
+      }
+      gl.bindVertexArray(null);
+    }
+    if (!tfo) tfo = gl.createTransformFeedback();
+    pcur = 0;
+  }
+  function setDensity(d){
+    pDensity = Math.max(0, Math.min(1, d));
+    pActive = Math.round(PCOUNT * (0.25 + pDensity*0.75));
+  }
+  function simParticles(S, dt){
+    const src = pcur, dst = 1-pcur;
+    gl.useProgram(progSim);
+    gl.uniform1f(U(progSim,'u_dt'), dt);
+    gl.uniform1f(U(progSim,'u_time'), S.t);
+    gl.uniform1f(U(progSim,'u_bass'), S.bass);
+    gl.uniform1f(U(progSim,'u_mid'), S.mid);
+    gl.uniform1f(U(progSim,'u_treble'), S.treb);
+    gl.uniform1f(U(progSim,'u_beat'), S.beat);
+    gl.uniform1f(U(progSim,'u_coil'), S.coil);
+    gl.uniform1f(U(progSim,'u_burst'), S.burst);
+    gl.uniform1f(U(progSim,'u_safe'), S.safe);
+    // the cloud's target radius: swells with bass, is reeled IN as tension winds up,
+    // and is thrown wide open by the release -- the breathing the web already does.
+    gl.uniform1f(U(progSim,'u_shell'), 0.78 + S.bass*0.50 + S.burst*0.40 - S.coil*0.30);
+    gl.uniform1f(U(progSim,'u_flow'),  1.15 + S.treb*0.85 + S.coil*0.70);
+    gl.uniform1f(U(progSim,'u_swirl'), 1.50 + S.treb*1.6 + S.coil*3.2 + S.beat*1.2);
+    // put the cursor into world space on the camera plane (undo the render yaw), so the
+    // particles it grabs are the ones actually under the pointer
+    const yaw = S.t*0.075 + S.bass*0.22, mx = mouse.x*2.4;
+    gl.uniform4f(U(progSim,'u_mouse'), mx*Math.cos(yaw), mouse.y*2.4, mx*Math.sin(yaw),
+                 mouse.down ? 1 : (mouse.over ? 2 : 0));
+
+    gl.bindVertexArray(pVAO[src]);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfo);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, pbuf[dst].pos);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, pbuf[dst].vel);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 2, pbuf[dst].dat);
+    gl.enable(gl.RASTERIZER_DISCARD);
+    gl.beginTransformFeedback(gl.POINTS);
+    gl.drawArrays(gl.POINTS, 0, pActive);
+    gl.endTransformFeedback();
+    gl.disable(gl.RASTERIZER_DISCARD);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+    gl.bindVertexArray(null);
+    pcur = dst;
+  }
+
+  // ---------------- modes (the hero visual) ----------------
+  // A mode owns one thing: drawing into sceneRT. Everything downstream -- bloom,
+  // tonemap, HUD, recording, fingerprint -- is shared, so a new mode is just a
+  // draw function plus its shaders.
+  let modeId = 'web';
+  function drawWeb(S){
+    bindRT(sceneRT);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progWeb);
+    gl.uniform2f(U(progWeb,'u_res'), RW, RH);
+    gl.uniform1f(U(progWeb,'u_time'), S.t);
+    gl.uniform1f(U(progWeb,'u_bass'), S.bass);
+    gl.uniform1f(U(progWeb,'u_mid'), S.mid);
+    gl.uniform1f(U(progWeb,'u_treble'), S.treb);
+    gl.uniform1f(U(progWeb,'u_beat'), S.beat);
+    gl.uniform1f(U(progWeb,'u_exposure'), S.expo);
+    gl.uniform1f(U(progWeb,'u_safe'), S.safe);
+    gl.uniform3fv(U(progWeb,'u_c1'), S.c1);
+    gl.uniform3fv(U(progWeb,'u_c2'), S.c2);
+    gl.uniform3fv(U(progWeb,'u_nodes'), nodeBuf);
+    gl.uniform4fv(U(progWeb,'u_edges'), edgeBuf);
+    gl.uniform1f(U(progWeb,'u_net'), netOn ? 1 : 0);
+    gl.uniform1f(U(progWeb,'u_coh'), netOn ? coh : 0);
+    gl.uniform1f(U(progWeb,'u_coil'), S.coil);
+    gl.uniform1f(U(progWeb,'u_burst'), S.burst);
+    gl.uniform2fv(U(progWeb,'u_fig'), figBuf);
+    gl.uniform1i(U(progWeb,'u_figN'), figN);
+    gl.uniform3fv(U(progWeb,'u_figA'), figA);
+    gl.uniform3fv(U(progWeb,'u_figB'), figB);
+    drawQuad();
+  }
+  function drawNebula(S, dt){
+    bindRT(sceneRT);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progGas);
+    gl.uniform2f(U(progGas,'u_res'), RW, RH);
+    gl.uniform1f(U(progGas,'u_time'), S.t);
+    gl.uniform1f(U(progGas,'u_bass'), S.bass);
+    gl.uniform1f(U(progGas,'u_mid'), S.mid);
+    gl.uniform1f(U(progGas,'u_treble'), S.treb);
+    gl.uniform1f(U(progGas,'u_beat'), S.beat);
+    gl.uniform1f(U(progGas,'u_coil'), S.coil);
+    gl.uniform1f(U(progGas,'u_burst'), S.burst);
+    gl.uniform1f(U(progGas,'u_safe'), S.safe);
+    gl.uniform1f(U(progGas,'u_exposure'), S.expo);
+    gl.uniform3fv(U(progGas,'u_c1'), S.c1);
+    gl.uniform3fv(U(progGas,'u_c2'), S.c2);
+    drawQuad();
+
+    simParticles(S, dt);
+
+    bindRT(sceneRT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);            // additive; sprites are premultiplied
+    gl.useProgram(progPts);
+    gl.uniform2f(U(progPts,'u_res'), RW, RH);
+    gl.uniform1f(U(progPts,'u_time'), S.t);
+    gl.uniform1f(U(progPts,'u_bass'), S.bass);
+    gl.uniform1f(U(progPts,'u_beat'), S.beat);
+    gl.uniform1f(U(progPts,'u_burst'), S.burst);
+    gl.uniform1f(U(progPts,'u_coil'), S.coil);
+    gl.uniform1f(U(progPts,'u_safe'), S.safe);
+    gl.uniform1f(U(progPts,'u_hue'), S.hue);
+    gl.uniform1f(U(progPts,'u_exposure'), S.expo);
+    gl.uniform1f(U(progPts,'u_cam'), 2.85 - S.beat*0.20*S.safe - S.burst*0.30);
+    gl.uniform1f(U(progPts,'u_focal'), 1.25);
+    gl.uniform1f(U(progPts,'u_psize'), 12.0 * (RH/1080));
+    gl.uniform3fv(U(progPts,'u_c1'), S.c1);
+    gl.uniform3fv(U(progPts,'u_c2'), S.c2);
+    gl.bindVertexArray(pVAO[pcur]);
+    gl.drawArrays(gl.POINTS, 0, pActive);
+    gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
+  }
+  // one frame: upload the spectrum, let the mode draw the scene, then post to canvas
+  function renderFrame(S, dt){
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fftTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
+    if (modeId === 'nebula' && nebulaOK) drawNebula(S, dt); else drawWeb(S);
+    postProcess(S);
+  }
+  // the per-frame state every mode and the post chain reads
+  function frameState(t, a){
+    const th = THEMES[+themeSel.value];
+    return {
+      t, bass:a.bass, mid:a.mid, treb:a.treb, beat,
+      coil, burst, expo: exposure(a.energy), safe: safeVal(),
+      // the harmonic drift is baked into c1/c2 here, so u_hue only carries the
+      // PER-PARTICLE spread (speed/seed) -- adding harmHue again would double-shift
+      c1: shiftHue(th.c1, harmHue), c2: shiftHue(th.c2, harmHue), hue: 0
+    };
+  }
+  // CPU-side twin of the shader's hueShift -- lets the harmonic drift be baked into
+  // the theme colors once per frame instead of per pixel.
+  function shiftHue(c, a){
+    const k = 0.5773502692, cs = Math.cos(a), sn = Math.sin(a);
+    const dot = k*(c[0]+c[1]+c[2]);
+    return new Float32Array([
+      c[0]*cs + (k*c[2] - k*c[1])*sn + k*dot*(1-cs),
+      c[1]*cs + (k*c[0] - k*c[2])*sn + k*dot*(1-cs),
+      c[2]*cs + (k*c[1] - k*c[0])*sn + k*dot*(1-cs),
+    ]);
   }
 
   // ---------------- NERV HUD (2D overlay) ----------------
@@ -958,6 +1688,20 @@
     vctx.fillStyle='rgba(255,206,158,0.6)';
     vctx.fillText('BLOOD TYPE: BLUE', m+120*s, H-m-30*s);
 
+    // tempo + key: the MAGI's read on the song's STRUCTURE, not just its loudness
+    const locked = bpm > 0 && bpmConf > 0.3;
+    vctx.fillStyle = amber;
+    vctx.fillText(`BPM ${locked ? Math.round(bpm) : '---'}   KEY ${keyIdx>=0 && keyConf>0.2 ? NOTE_NAMES[keyIdx] : '--'}`,
+                  m+14*s, H-m-52*s);
+    if (locked){                       // four pips: watch the bar turn over
+      const px = m+185*s, py = H-m-46*s;
+      for (let i=0;i<4;i++){
+        vctx.globalAlpha = (i === beatCount) ? 1 - beatPhase*0.55 : 0.2;
+        vctx.beginPath(); vctx.arc(px + i*15*s, py, 4*s, 0, 6.2832); vctx.fill();
+      }
+      vctx.globalAlpha = 1;
+    }
+
     // warning flash on strong beats
     if (beat > 0.55) {
       vctx.globalAlpha = Math.min(1, beat);
@@ -979,31 +1723,20 @@
   }
 
   // ---------------- Main loop ----------------
-  let running=false, startT=performance.now();
+  let running=false, startT=performance.now(), lastFrameT=performance.now();
   function loop(now){
     if (!running) return;
     requestAnimationFrame(loop);
+    const dtMs = Math.min(Math.max(now - lastFrameT, 1), 100);
+    lastFrameT = now;
+    const dt = dtMs/1000;
+    adaptResolution(dtMs);
     analyser.getByteFrequencyData(freqData);
     analyser.getByteTimeDomainData(timeData);
-    const a = analyze(now);
-    const th = THEMES[+themeSel.value];
-
-    // upload fft to GPU
-    gl.bindTexture(gl.TEXTURE_2D, fftTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
-    // uniforms
-    gl.uniform2f(uni.u_res, W, H);
-    gl.uniform1f(uni.u_time, (now-startT)/1000);
-    gl.uniform1f(uni.u_bass, a.bass);
-    gl.uniform1f(uni.u_mid, a.mid);
-    gl.uniform1f(uni.u_treble, a.treb);
-    gl.uniform1f(uni.u_beat, beat);
-    gl.uniform3fv(uni.u_c1, th.c1);
-    gl.uniform3fv(uni.u_c2, th.c2);
-    gl.uniform1f(uni.u_exposure, exposure(a.energy));
-    gl.uniform1f(uni.u_safe, safeVal());
-    applyNet(now);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const a = analyze(now, dt);
+    const S = frameState((now-startT)/1000, a);
+    if (modeId === 'web') updateNet(dt, inputGain);
+    renderFrame(S, dt);
 
     // composite: GPU frame -> 2D canvas, then HUD on top
     vctx.drawImage(glCanvas, 0, 0, W, H);
@@ -1143,7 +1876,18 @@
   safeBtn.addEventListener('click', () => { safe = !safe; reflectSafe(); });
   fpBtn.addEventListener('click', () => { fpMode = !fpMode; fpBtn.classList.toggle('primary', fpMode); });
   fpSaveBtn.addEventListener('click', fpSave);
-  nodeSlider.addEventListener('input', () => setNodeCount(sliderToNodes(+nodeSlider.value)));
+  // one slider, two meanings: node count for the web, particle density for the nebula
+  function applySlider(){
+    const v = +nodeSlider.value;
+    if (modeId === 'nebula') setDensity(v); else setNodeCount(sliderToNodes(v));
+  }
+  nodeSlider.addEventListener('input', applySlider);
+  modeSel.addEventListener('change', () => {
+    modeId = modeSel.value;
+    nodeLbl.textContent = modeId === 'nebula' ? 'Density' : 'Nodes';
+    netBtn.style.display = modeId === 'nebula' ? 'none' : '';
+    applySlider();
+  });
   // sync button to the OS-default calm state applied at boot
   try { if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) safe = true; } catch(e){}
   reflectSafe();
@@ -1205,6 +1949,8 @@
       themeSel.value = String(THEMES.indexOf(th));
       safe  = tp('safe',0) > 0.5;
       netOn = tp('net',1) > 0.5;
+      if (P.has('mode')){ modeId = P.get('mode')==='nebula' ? 'nebula' : 'web'; modeSel.value = modeId; }
+      if (P.has('density')) setDensity(tp('density',0.8));
       const bass=tp('bass',0.1), mid=tp('mid',0.1), treb=tp('treb',0.1), bt=tp('beat',0), tf=tp('t',2.0);
       const energy = bass*0.6 + mid*0.3 + treb*0.1;
       const ex = P.has('expo') ? tp('expo',1) : Math.max(0.5, 1.0/(1.0+energy*1.25));
@@ -1246,25 +1992,23 @@
         return;
       }
       hint.classList.add('hidden');
+      // deterministic state object -- same shape the live loop builds
+      const c1 = shiftHue(th.c1, 0), c2 = shiftHue(th.c2, 0);
+      const S = { t: tf, bass, mid, treb, beat: bt, coil, burst,
+                  expo: ex, safe: safe?0.2:1.0, c1, c2, hue: 0 };
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, fftTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
+      updateNet(0, 1.0);
+      if (modeId === 'nebula' && nebulaOK){
+        // settle the cloud: the sim is iterative, so a single step would only ever
+        // screenshot the seed distribution. Warm it up with fixed steps first.
+        const warm = P.has('warm') ? (tp('warm',180)|0) : 180;
+        for (let i=0;i<warm;i++) simParticles({...S, t: tf - (warm-i)*0.016}, 0.016);
+      }
       let _tframes = 0;
       (function testLoop(){
-        gl.uniform2f(uni.u_res, W, H);
-        gl.uniform1f(uni.u_time, tf);
-        gl.uniform1f(uni.u_bass, bass); gl.uniform1f(uni.u_mid, mid); gl.uniform1f(uni.u_treble, treb);
-        gl.uniform1f(uni.u_beat, bt);
-        gl.uniform1f(uni.u_exposure, ex);
-        gl.uniform1f(uni.u_safe, safe?0.2:1.0);
-        gl.uniform3fv(uni.u_c1, th.c1); gl.uniform3fv(uni.u_c2, th.c2);
-        gl.bindTexture(gl.TEXTURE_2D, fftTex);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
-        updateNet(0, 1.0);
-        gl.uniform3fv(uni.u_nodes, nodeBuf); gl.uniform4fv(uni.u_edges, edgeBuf);
-        gl.uniform1f(uni.u_net, netOn?1:0);
-        gl.uniform1f(uni.u_coh, netOn ? coh : 0);
-        gl.uniform1f(uni.u_coil, coil); gl.uniform1f(uni.u_burst, burst);
-        gl.uniform2fv(uni.u_fig, figBuf); gl.uniform1i(uni.u_figN, figN);
-        gl.uniform3fv(uni.u_figA, figA); gl.uniform3fv(uni.u_figB, figB);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        renderFrame(S, 0.016);
         vctx.drawImage(glCanvas, 0, 0, W, H);
         drawHUD({bass,mid,treb,energy}, tf*1000);
         // render a few static frames then STOP so headless virtual-time can idle
@@ -1275,20 +2019,17 @@
     }
 
     // idle preview so it isn't blank before audio loads
+    let idleT = performance.now();
     (function idle(now){
       if (!running) {
         now = now || performance.now();
-        gl.uniform2f(uni.u_res, W, H);
-        gl.uniform1f(uni.u_time, now/1000);
-        gl.uniform1f(uni.u_bass, 0.12+0.05*Math.sin(now/700));
-        gl.uniform1f(uni.u_mid, 0.1); gl.uniform1f(uni.u_treble, 0.1);
-        gl.uniform1f(uni.u_beat, 0.0);
-        gl.uniform1f(uni.u_exposure, 1.0);
-        gl.uniform1f(uni.u_safe, safeVal());
-        const th = THEMES[+themeSel.value];
-        gl.uniform3fv(uni.u_c1, th.c1); gl.uniform3fv(uni.u_c2, th.c2);
-        applyNet(now);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        const dt = Math.min(Math.max(now - idleT, 1), 100)/1000;
+        idleT = now;
+        const a = { bass: 0.12+0.05*Math.sin(now/700), mid: 0.1, treb: 0.1, energy: 0.12 };
+        const S = frameState(now/1000, a);
+        S.beat = 0; S.expo = 1.0;
+        if (modeId === 'web') updateNet(dt, 1.0);
+        renderFrame(S, dt);
         vctx.drawImage(glCanvas, 0, 0, W, H);
         drawHUD({bass:0,mid:0,treb:0,energy:0}, now);
         requestAnimationFrame(idle);
