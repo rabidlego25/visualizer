@@ -447,7 +447,7 @@
     float f = fftAt(cellR*0.045);                      // audio energy for this ring
     float ripple = 0.5 + 0.5*sin(cellR*0.9 - t*3.2);   // expanding pulse
     // low ambient so idle stays dark/clean; edges light up with audio + beats
-    float glow = edge * (0.05 + f*2.4 + u_beat*ripple*2.6*u_safe + u_burst*1.2);   // release flashes the field
+    float glow = edge * (0.05 + f*2.0 + u_beat*ripple*1.8*u_safe + u_burst*0.7);   // release flashes the field (restrained)
     vec3 hexCol = mix(u_c2, u_c1, clamp(f*1.6 + u_beat*0.5, 0.0, 1.0));
     hexCol = hueShift(hexCol, sin(cellR*0.30 + t*0.20)*0.16 + f*0.25); // subtle shimmer
     // AT-field recedes as the web coalesces into a silhouette, so the figure reads
@@ -482,7 +482,7 @@
     // --- cruciform light burst on beat (bigger, brighter) ---
     float cross = exp(-abs(uv.x)*16.0) + exp(-abs(uv.y)*16.0);
     cross += 0.5*(exp(-abs(uv.x)*5.0) + exp(-abs(uv.y)*5.0)); // wide bloom arms
-    col += mix(u_c1, vec3(1.0,0.95,0.85), 0.6) * cross * u_beat * (0.7 + 1.4*u_safe);
+    col += mix(u_c1, vec3(1.0,0.95,0.85), 0.6) * cross * u_beat * (0.4 + 0.9*u_safe);
 
     return col;
   }
@@ -517,13 +517,13 @@
     // neural web stays readable: dims far less than the background (0.7 -> ~30% of the dimming)
     // ...but as the figure coalesces the web RECEDES so the solid silhouette dominates
     // (fixes the old "sync high = unreadable bright blob").
-    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.7) * (1.0 - u_coh*0.30) * 1.2;
-    net *= (1.0 + u_coil*0.35 + u_burst*0.6);          // tension glows; release flashes
+    vec3 net = neuralNet(uv, t) * u_net * mix(u_exposure, 1.0, 0.5) * (1.0 - u_coh*0.30);
+    net *= (1.0 + u_coil*0.18 + u_burst*0.30);         // tension glows; release flashes (restrained)
     vec3 fig = figure(uv, t);
     vec3 col = scn + net + fig;
 
     // ---- VIVID grade (Testify / anime pop) ----
-    col += col*col*0.42;                                    // gentler HDR bloom lift
+    col += col*col*0.28;                                    // HDR bloom lift (restrained so highlights don't blow)
     float l = dot(col, vec3(0.299,0.587,0.114));
     col = mix(vec3(l), col, 1.5);                           // saturation punch
     col = hueShift(col, sin(t*0.08)*0.10);                  // slow spectral shimmer
@@ -595,7 +595,7 @@
   function exposure(energy){
     const rate = energy > expoAdapt ? 0.035 : 0.012;   // rise ~0.5s, fall slower
     expoAdapt += (energy - expoAdapt) * rate;
-    return Math.max(0.5, 1.0 / (1.0 + expoAdapt*1.25)); // sustained-loud -> down to ~0.5
+    return Math.max(0.42, 1.0 / (1.0 + expoAdapt*1.7)); // sustained-loud settles darker
   }
   // calm mode: dampens flashing/strobe/punch (feeds u_safe). Default honors the OS setting.
   let safe = false;
@@ -607,7 +607,7 @@
     const rawB = band(1,18), rawM = band(40,180), rawT = band(300,700);
     const rawE = rawB*0.6 + rawM*0.3 + rawT*0.1;
     agcEnv = agcEnv*0.985 + rawE*0.015;                 // slow loudness estimate (~1.5s)
-    inputGain = Math.max(0.8, Math.min(2.0, 0.42/(agcEnv+0.06)));
+    inputGain = Math.max(0.7, Math.min(1.8, 0.33/(agcEnv+0.06)));
     const g = inputGain;
     const bass = Math.min(rawB*g, 1.4);
     const mid  = Math.min(rawM*g, 1.4);
