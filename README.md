@@ -8,13 +8,21 @@ Everything runs locally in the browser — no uploads, no signup, works offline.
 
 ## What's inside
 
-| Visualizer | Tech | Highlights |
+| Page | Tech | Highlights |
 |-----------|------|-----------|
 | **Pulse** (`pulse.html`) | Canvas 2D | Radial aurora, frequency bars, waveform ribbon, particle orbit · 5 palettes |
-| **MAGI** (`eva.html`) | WebGL2 (GPU) | Neon-Genesis NERV terminal · AT-field hex grid, eye-core, cruciform bursts, live neural network |
+| **MAGI** (`eva.html`) | WebGL2 (GPU) | Four engines — neural web, 100k-particle nebula, spectral waterfall, fluid smoke · 5 palettes · feedback trails · your own title card |
+| **Timeline** (`analyze.html`) | Web Audio + DSP | Analyses a whole track *before* playback: beat grid, downbeats, key, sections, drops, and separated drum/harmony/vocal envelopes |
 
-Both support: loading audio or mic input, a scrub/seek timeline, one-click video
-recording, and vertical (9:16) / square (1:1) / wide (16:9) formats for any platform.
+Both visualizers support: loading audio or mic input, a scrub/seek timeline, one-click
+video recording, and vertical (9:16, the default) / square (1:1) / wide (16:9) formats.
+MAGI adds bar-locked loop recording, Reels safe-area guides, and a song "fingerprint"
+you can export as cover art.
+
+### Install it as an app
+
+It's a PWA, so it works offline and installs to a home screen:
+Android Chrome ⋮ → *Add to Home screen*; iOS Safari → Share → *Add to Home Screen*.
 
 ## Run locally
 
@@ -34,9 +42,25 @@ python3 -m http.server 8000
 
 ## Notes
 
-- Recordings save as `.webm`. That plays on YouTube and most desktop uploads;
-  some phone apps prefer `.mp4` (convertible with any tool, e.g. HandBrake).
+- Recordings save as `.mp4` where the browser supports it, falling back to `.webm`.
+- Sending a take over WhatsApp as a *video* re-encodes it to ~480–720p. Attach it as a
+  **Document** instead and the file transfers untouched.
 - MAGI needs a WebGL2-capable browser (any recent Chrome, Safari, Edge, Firefox).
+  Fluid smoke additionally needs float render targets, and hides itself when they're missing.
+
+## For developers
+
+Plain static files — no build step, no dependencies, no backend. Two harnesses let the
+visual and audio code be checked without a human in the loop:
+
+```bash
+python3 tools/render_eval.py      # headless renders of eva.html -> contact sheet + metrics
+node tools/test_analysis.mjs      # analysis.js vs a synthesised song with known ground truth
+```
+
+`analysis.js` is the offline song analyser (also runs in Node); `analyze.html` is its
+inspection page — open it with **Click** enabled to hear a metronome on the detected
+beat grid over your own track.
 
 ## License
 
