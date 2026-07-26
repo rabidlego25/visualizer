@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#06060a">
+<title>Timeline — whole-song analysis</title>
+<meta name="description" content="Offline whole-song analysis: beat grid, downbeats, sections, drops and per-instrument envelopes, computed before playback starts.">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --bg:#06060a; --panel:#101018; --line:#23232f; --text:#eaeaf2; --muted:#8b8ba0; --accent:#7c5cff; }
+  body {
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
+  .kicker { font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--muted); }
+  .lede { color: var(--muted); font-size: 14px; line-height: 1.6; max-width: 760px; margin: 10px 0 22px; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 18px; }
+  button, label.file {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    padding: 9px 15px; border-radius: 8px; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  button:hover, label.file:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; border-color: var(--line); }
+  button.on { border-color: var(--accent); background: #1a1530; }
+  input[type=file] { display: none; }
+  .status { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap: 1px;
+           background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 18px; }
+  .stat { background: var(--panel); padding: 12px 14px; }
+  .stat .k { font-size: 10px; letter-spacing: 1.6px; text-transform: uppercase; color: var(--muted); }
+  .stat .v { font-size: 19px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  canvas { display: block; width: 100%; border: 1px solid var(--line); border-radius: 10px; background: #0a0a10; cursor: crosshair; }
+  .capt { font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; }
+  td.lbl { font-weight: 600; }
+  .drop { color: #ff5ea8; } .build { color: #ffb03c; } .breakdown { color: #4cc9ff; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.6; }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="kicker">Stage 1</span>
+    <h1>Whole-song analysis</h1>
+  </header>
+  <p class="lede">
+    The visualizer's live listener is causal — it only ever sees the last couple of seconds, so it can
+    chase a drop but never build toward one. This runs the whole track through an offline pass first:
+    beat grid, downbeats, sections, drops, and separated instrument envelopes, all with timestamps.
+    Nothing is uploaded; the analysis runs in your browser.
+    <b>Play with Click on</b> to check the grid by ear — if the clicks sit in the pocket, the timeline is right.
+  </p>
+
+  <div class="bar">
+    <label class="file">Choose audio<input type="file" id="file" accept="audio/*"></label>
+    <button id="demo">Demo tone</button>
+    <button id="play" disabled>▶ Play</button>
+    <button id="click" disabled>Click</button>
+    <button id="save" disabled>⤓ timeline.json</button>
+    <span class="status" id="status">no track loaded</span>
+  </div>
+
+  <div id="out" class="hide">
+    <div class="stats" id="stats"></div>
+    <div class="capt">Overview — sections, energy arc, separated envelopes. Click to seek.</div>
+    <canvas id="ov" height="260"></canvas>
+    <div class="capt">Detail — ±4s around the playhead. Tall ticks are downbeats, short ticks beats, the fill is the onset envelope.</div>
+    <canvas id="dt" height="150"></canvas>
+    <table id="tbl"></table>
+    <p class="hint" id="notes"></p>
+  </div>
+</div>
+
+<script src="analysis.js"></script>
+<script>
+(function(){
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const ov = $('ov'), dt = $('dt');
+  let ctx = null, buffer = null, timeline = null, env = {};
+  let src = null, startedAt = 0, offset = 0, playing = false, clickOn = false;
+  let nextBeat = 0, schedTimer = 0;
+
+  const fmt = t => { const m = Math.floor(t/60), s = t-m*60; return m+':'+(s<10?'0':'')+s.toFixed(1); };
+  // a headless browser's virtual clock reports ~0ms, and "Infinity× realtime" helps nobody
+  const speed = (dur, ms) => ms > 30 ? (dur/(ms/1000)).toFixed(0) + '×' : '—';
+
+  // ---- decode + analyse ----------------------------------------------------
+  function audioCtx(){ return ctx || (ctx = new (window.AudioContext||window.webkitAudioContext)()); }
+
+  async function loadFile(f){
+    stop();
+    $('status').textContent = 'decoding ' + f.name + '…';
+    const buf = await f.arrayBuffer();
+    buffer = await audioCtx().decodeAudioData(buf);
+    run(f.name);
+  }
+
+  function run(name){
+    const L = buffer.getChannelData(0);
+    const R = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+    const t0 = performance.now();
+    const finish = res => {
+      if (!res.ok){ $('status').textContent = 'could not analyse: ' + res.reason; return; }
+      timeline = res;
+      env = {};
+      for (const k in res.env) if (k !== 'rate') env[k] = SongAnalysis.unpackEnv(res.env[k]);
+      const ms = performance.now()-t0;
+      $('status').textContent = name + ' — analysed in ' + (ms/1000).toFixed(1) + 's ('
+        + speed(res.duration, ms) + ' realtime)';
+      $('out').classList.remove('hide');
+      $('play').disabled = $('click').disabled = $('save').disabled = false;
+      report();
+      resize();
+    };
+    const onErr = m => { $('status').textContent = 'analysis failed: ' + m; };
+
+    // A Worker keeps the page responsive, but Workers are blocked on file:// — fall back
+    // to the main thread there rather than simply failing.
+    // ?worker=0 forces the main thread: a headless browser's virtual clock races past a
+    // Worker (which runs on the real one) and screenshots the page before it finishes.
+    let w = null;
+    if (!/[?&]worker=0/.test(location.search)){
+      try { w = new Worker('analysis-worker.js'); } catch (e) { w = null; }
+    }
+    if (w){
+      w.onmessage = e => {
+        const d = e.data;
+        if (d.type === 'progress') $('status').textContent = d.phase + ' ' + Math.round(d.frac*100) + '%';
+        else if (d.type === 'done'){ finish(d.result); w.terminate(); }
+        else { onErr(d.message); w.terminate(); }
+      };
+      w.onerror = () => { w.terminate(); mainThread(); };
+      const lc = L.slice().buffer, rc = R ? R.slice().buffer : null;
+      w.postMessage({ left: lc, right: rc, sampleRate: buffer.sampleRate }, rc ? [lc, rc] : [lc]);
+    } else mainThread();
+
+    function mainThread(){
+      $('status').textContent = 'analysing (main thread — the page will freeze for a moment)…';
+      setTimeout(() => {
+        try { finish(SongAnalysis.analyzeSong({ left: L, right: R, sampleRate: buffer.sampleRate })); }
+        catch (e){ onErr(String(e)); }
+      }, 30);
+    }
+  }
+
+  // ---- a demo track, so the page can be exercised without a file -----------
+  function demoTrack(){
+    const sr = 44100, bpm = 128, beat = 60/bpm, bars = 16, n = Math.round(bars*4*beat*sr);
+    const b = audioCtx().createBuffer(2, n, sr);
+    const L = b.getChannelData(0), R = b.getChannelData(1);
+    let seed = 7;
+    const rnd = () => { seed = (seed*1103515245+12345) & 0x7fffffff; return seed/0x3fffffff - 1; };
+    const notes = [220, 261.63, 329.63];
+    for (let bar=0; bar<bars; bar++){
+      const t = bar*4*beat, loud = bar >= 4 && bar < 12;
+      for (let i=0;i<3;i++){
+        const f = notes[i]*(bar%4 < 2 ? 1 : 1.122), s0 = Math.round(t*sr), s1 = Math.min(n, s0+Math.round(4*beat*sr));
+        for (let s=s0;s<s1;s++){
+          const u = (s-s0)/sr, v = 0.14*Math.exp(-u*0.4)*Math.sin(2*Math.PI*f*u);
+          L[s] += v*(i===1?0.4:0.9); R[s] += v*(i===1?0.9:0.4);
+        }
+      }
+      if (!loud) continue;
+      for (let k=0;k<4;k++){
+        const s0 = Math.round((t+k*beat)*sr);
+        for (let s=s0;s<Math.min(n,s0+Math.round(0.28*sr));s++){
+          const u = (s-s0)/sr, v = 0.9*Math.exp(-u*20)*Math.sin(2*Math.PI*(130-85*Math.min(1,u*10))*u*6);
+          L[s] += v; R[s] += v;
+        }
+        const h0 = Math.round((t+k*beat+beat*0.5)*sr);
+        let pv = 0;
+        for (let s=h0;s<Math.min(n,h0+Math.round(0.05*sr));s++){
+          const u = (s-h0)/sr, x = rnd(), y = x-pv; pv = x;
+          L[s] += 0.12*Math.exp(-u*60)*y*0.7; R[s] += 0.12*Math.exp(-u*60)*y*1.3;
+        }
+      }
+    }
+    let pk = 0; for (let i=0;i<n;i++) pk = Math.max(pk, Math.abs(L[i]), Math.abs(R[i]));
+    for (let i=0;i<n;i++){ L[i] *= 0.89/pk; R[i] *= 0.89/pk; }
+    buffer = b;
+    run('demo tone (128 BPM)');
+  }
+
+  // ---- transport -----------------------------------------------------------
+  function play(from){
+    stop();
+    const c = audioCtx();
+    if (c.state === 'suspended') c.resume();
+    src = c.createBufferSource();
+    src.buffer = buffer;
+    src.connect(c.destination);
+    offset = from == null ? offset : from;
+    startedAt = c.currentTime - offset;
+    src.start(0, offset);
+    playing = true;
+    $('play').textContent = '❚❚ Pause';
+    nextBeat = 0;
+    const beats = timeline.beats;
+    while (nextBeat < beats.length && beats[nextBeat] < offset) nextBeat++;
+    schedTimer = setInterval(schedule, 60);
+    requestAnimationFrame(frame);
+  }
+  function stop(){
+    if (src){ try { src.stop(); } catch(e){} src.disconnect(); src = null; }
+    if (schedTimer){ clearInterval(schedTimer); schedTimer = 0; }
+    if (playing) offset = now();
+    playing = false;
+    $('play').textContent = '▶ Play';
+  }
+  function now(){ return playing ? Math.min(buffer.duration, audioCtx().currentTime - startedAt) : offset; }
+
+  // Lookahead click scheduler. setTimeout is far too jittery to place a click on a beat;
+  // scheduling ~200ms ahead on the audio clock is sample-accurate.
+  function schedule(){
+    if (!clickOn || !playing) return;
+    const c = audioCtx(), beats = timeline.beats, downs = timeline.downbeats;
+    const horizon = c.currentTime + 0.25;
+    while (nextBeat < beats.length){
+      const when = startedAt + beats[nextBeat];
+      if (when > horizon) break;
+      if (when >= c.currentTime){
+        const isDown = downs.some(d => Math.abs(d - beats[nextBeat]) < 1e-6);
+        const o = c.createOscillator(), g = c.createGain();
+        o.frequency.value = isDown ? 1600 : 900;
+        g.gain.setValueAtTime(isDown ? 0.5 : 0.22, when);
+        g.gain.exponentialRampToValueAtTime(0.0001, when + 0.045);
+        o.connect(g); g.connect(c.destination);
+        o.start(when); o.stop(when + 0.05);
+      }
+      nextBeat++;
+    }
+  }
+
+  // ---- drawing -------------------------------------------------------------
+  const SECT_COL = { INTRO:'#3a3a52', VERSE:'#2f4a6b', BUILD:'#7a5a20', CHORUS:'#6b2f5a', DROP:'#7a2444', BREAKDOWN:'#1f4f57', OUTRO:'#33334a' };
+
+  function setup(cv){
+    const dpr = Math.min(2, window.devicePixelRatio||1);
+    const w = cv.clientWidth;
+    cv.width = Math.round(w*dpr); cv.height = Math.round(cv.clientHeight*dpr);
+    const g = cv.getContext('2d');
+    g.setTransform(dpr,0,0,dpr,0,0);
+    g.clearRect(0,0,w,cv.clientHeight);
+    return { g, w, h: cv.clientHeight };
+  }
+
+  function envLane(g, w, y0, y1, arr, rate, dur, colour, label){
+    let peak = 0;
+    for (let i=0;i<arr.length;i++) if (arr[i] > peak) peak = arr[i];
+    peak = peak || 1;
+    g.beginPath(); g.moveTo(0, y1);
+    for (let x=0;x<w;x++){
+      const a = Math.floor(x/w*dur*rate), b = Math.floor((x+1)/w*dur*rate);
+      let m = 0;
+      for (let i=a;i<b && i<arr.length;i++) if (arr[i] > m) m = arr[i];
+      g.lineTo(x, y1 - (m/peak)*(y1-y0));
+    }
+    g.lineTo(w, y1); g.closePath();
+    g.fillStyle = colour; g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.45)'; g.font = '10px system-ui';
+    g.fillText(label, 6, y0 + 11);
+  }
+
+  function drawOverview(){
+    const { g, w, h } = setup(ov);
+    const T = timeline, dur = T.duration, rate = T.env.rate;
+    const x = t => t/dur*w;
+
+    // sections as bands behind everything
+    for (const s of T.sections){
+      g.fillStyle = (SECT_COL[s.label] || '#333') + '';
+      g.globalAlpha = 0.30; g.fillRect(x(s.start), 0, x(s.end)-x(s.start), h); g.globalAlpha = 1;
+      g.strokeStyle = 'rgba(255,255,255,0.25)'; g.beginPath();
+      g.moveTo(x(s.start)+0.5, 0); g.lineTo(x(s.start)+0.5, h); g.stroke();
+      g.fillStyle = '#fff'; g.font = '600 11px system-ui';
+      g.fillText(s.label, x(s.start)+6, 14);
+    }
+
+    const lanes = [
+      ['percussive', 'rgba(255,94,168,0.55)', 'percussive'],
+      ['harmonic',   'rgba(124,92,255,0.55)', 'harmonic'],
+      ['vocal',      'rgba(76,201,255,0.55)', 'vocal (centre-panned)']
+    ];
+    let y = 26;
+    const lh = 46;
+    for (const [k, col, label] of lanes){
+      if (!env[k]) continue;
+      envLane(g, w, y, y+lh, env[k], rate, dur, col, label);
+      y += lh + 4;
+    }
+
+    // energy arc, per bar
+    if (T.arc.length){
+      g.strokeStyle = '#ffb03c'; g.lineWidth = 1.5; g.beginPath();
+      T.arc.forEach((v, i) => {
+        const t = T.downbeats[i] != null ? T.downbeats[i] : (i/T.arc.length)*dur;
+        const px = x(t), py = h - 24 - v*(h - 24 - y - 6);
+        i ? g.lineTo(px, py) : g.moveTo(px, py);
+      });
+      g.stroke(); g.lineWidth = 1;
+      g.fillStyle = 'rgba(255,176,60,0.8)'; g.font = '10px system-ui';
+      g.fillText('energy arc (per bar)', 6, h - 30);
+    }
+
+    // downbeat ticks along the bottom
+    g.fillStyle = 'rgba(255,255,255,0.30)';
+    for (const d of T.downbeats) g.fillRect(x(d), h-18, 1, 8);
+
+    // events
+    for (const e of T.events){
+      const col = e.type === 'drop' ? '#ff5ea8' : e.type === 'breakdown' ? '#4cc9ff' : '#ffb03c';
+      g.strokeStyle = col; g.beginPath(); g.moveTo(x(e.t)+0.5, 0); g.lineTo(x(e.t)+0.5, h); g.stroke();
+      g.fillStyle = col; g.font = '600 9px system-ui';
+      g.fillText(e.type.toUpperCase(), x(e.t)+4, h-22);
+    }
+
+    // playhead
+    const t = now();
+    g.strokeStyle = '#fff'; g.beginPath(); g.moveTo(x(t)+0.5, 0); g.lineTo(x(t)+0.5, h); g.stroke();
+    g.fillStyle = 'rgba(255,255,255,0.55)'; g.font = '10px system-ui';
+    g.fillText(fmt(t), Math.min(w-40, x(t)+4), h-4);
+  }
+
+  function drawDetail(){
+    const { g, w, h } = setup(dt);
+    const T = timeline, rate = T.env.rate, t = now(), span = 8;
+    const t0 = t - span/2, x = tt => (tt-t0)/span*w;
+    const on = env.onset;
+    let peak = 0; for (let i=0;i<on.length;i++) if (on[i] > peak) peak = on[i];
+    peak = peak || 1;
+
+    g.beginPath(); g.moveTo(0, h-20);
+    for (let px=0; px<w; px++){
+      const i = Math.round((t0 + px/w*span)*rate);
+      const v = (i >= 0 && i < on.length) ? on[i]/peak : 0;
+      g.lineTo(px, h-20 - v*(h-34));
+    }
+    g.lineTo(w, h-20); g.closePath();
+    g.fillStyle = 'rgba(124,92,255,0.45)'; g.fill();
+
+    for (const b of T.beats){
+      if (b < t0 || b > t0+span) continue;
+      const isDown = T.downbeats.some(d => Math.abs(d-b) < 1e-6);
+      g.fillStyle = isDown ? '#fff' : 'rgba(255,255,255,0.4)';
+      g.fillRect(x(b), isDown ? 8 : h-34, 1, isDown ? h-16 : 14);
+    }
+    g.strokeStyle = '#ff5ea8'; g.beginPath(); g.moveTo(w/2+0.5, 0); g.lineTo(w/2+0.5, h); g.stroke();
+    g.fillStyle = 'rgba(255,255,255,0.5)'; g.font = '10px system-ui';
+    g.fillText(fmt(Math.max(0,t)), 6, 12);
+  }
+
+  function frame(){
+    if (!timeline) return;
+    drawOverview(); drawDetail();
+    if (playing && now() >= buffer.duration - 0.02){ stop(); offset = 0; }
+    if (playing) requestAnimationFrame(frame);
+  }
+  function resize(){ if (timeline){ drawOverview(); drawDetail(); } }
+
+  // ---- report --------------------------------------------------------------
+  function report(){
+    const T = timeline;
+    const stat = (k, v, s) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}${s?' <small>'+s+'</small>':''}</div></div>`;
+    $('stats').innerHTML =
+      stat('Tempo', T.tempo.bpm.toFixed(1), 'BPM · conf ' + T.tempo.confidence.toFixed(2)) +
+      stat('Meter', T.tempo.meter + '/4', T.downbeats.length + ' bars') +
+      stat('Key', T.key.tonic + ' ' + T.key.mode, 'conf ' + T.key.confidence.toFixed(2)) +
+      stat('Length', fmt(T.duration), T.beats.length + ' beats') +
+      stat('Sections', T.sections.length, T.events.length + ' events') +
+      stat('Analysis', (T.analysisMs/1000).toFixed(1) + 's', speed(T.duration, T.analysisMs) + ' realtime');
+
+    let rows = '<tr><th>Bars</th><th>Start</th><th>Length</th><th>Label</th><th>Energy</th><th>Percussive</th><th>Key</th></tr>';
+    for (const s of T.sections){
+      rows += `<tr><td>${s.startBar}–${s.endBar}</td><td>${fmt(s.start)}</td><td>${(s.end-s.start).toFixed(1)}s</td>`
+           +  `<td class="lbl ${s.label.toLowerCase()}">${s.label}</td><td>${s.energy.toFixed(2)}</td>`
+           +  `<td>${s.percussive.toFixed(2)}</td><td>${s.key.tonic} ${s.key.mode}</td></tr>`;
+    }
+    $('tbl').innerHTML = rows;
+    $('notes').innerHTML =
+      'Section labels are a heuristic over the per-bar energy arc, not ground truth — they exist so a director can '
+      + 'say “cut on the drop” without a human annotating the song. '
+      + (T.stems.vocalAvailable ? 'The vocal lane is a centre-panned/harmonic proxy, not real source separation: it finds a centred lead, and will also find anything else parked in the middle.'
+                                : 'Mono input — no vocal lane (the proxy needs two channels).')
+      + ' Timeline JSON is ' + (JSON.stringify(T).length/1024).toFixed(0) + ' KB.';
+  }
+
+  // ---- wiring --------------------------------------------------------------
+  $('file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  $('demo').addEventListener('click', () => { stop(); $('status').textContent = 'synthesising demo…'; setTimeout(demoTrack, 20); });
+  $('play').addEventListener('click', () => { playing ? (stop(), frame()) : play(); });
+  $('click').addEventListener('click', e => { clickOn = !clickOn; e.target.classList.toggle('on', clickOn); });
+  $('save').addEventListener('click', () => {
+    const b = new Blob([JSON.stringify(timeline)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = 'timeline.json'; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  for (const cv of [ov, dt]){
+    cv.addEventListener('click', e => {
+      if (!timeline) return;
+      const r = cv.getBoundingClientRect(), f = (e.clientX-r.left)/r.width;
+      const t = cv === ov ? f*timeline.duration : now() + (f-0.5)*8;
+      offset = Math.max(0, Math.min(buffer.duration-0.05, t));
+      if (playing) play(offset); else frame();
+    });
+  }
+  window.addEventListener('resize', resize);
+  // ?demo=1 runs the whole pipeline with no interaction, so a headless browser can
+  // verify the page end to end (same reason eva.html has ?test=).
+  if (/[?&]demo=1/.test(location.search)) setTimeout(() => {
+    try { demoTrack(); } catch (e){ $('status').textContent = 'demo failed: ' + (e && e.message || e); }
+  }, 50);
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f) loadFile(f);
+  });
+})();
+</script>
+</body>
+</html>
