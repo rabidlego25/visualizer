@@ -833,8 +833,8 @@
   // vorticity confinement: push energy back INTO the vortices the grid keeps damping
   // out. Without it the smoke goes soft and featureless within a couple of seconds.
   const FRAG_FVORT = `${FLUID_HEAD}
-  uniform sampler2D u_vel, u_curl;
-  uniform float u_dt, u_vort;
+  uniform sampler2D u_vel, u_curl, u_dye;
+  uniform float u_dt, u_vort, u_buoy, u_hcross, u_drag;
   void main(){
     vec2 uv = fuv(), dx = vec2(u_texel.x,0.0), dy = vec2(0.0,u_texel.y);
     float l = texture(u_curl, uv-dx).x, r = texture(u_curl, uv+dx).x;
@@ -843,7 +843,28 @@
     vec2 N = 0.5*vec2(abs(r)-abs(l), abs(t)-abs(b));
     N /= (length(N) + 1e-5);
     vec2 force = u_vort * c * vec2(N.y, -N.x);
-    fragColor = vec4(texture(u_vel, uv).xy + force*u_dt, 0.0, 1.0);
+    // BUOYANCY. The field used to get all its energy from splats, which made the
+    // standing emitter a constant upward JET: every parcel of dye was fired at the
+    // ceiling, and with almost no velocity damping the whole field converged to a
+    // uniform updraft that swept the frame empty and pooled the smoke along the top.
+    // (Measured: nonblack 73% at warm=400 collapsing to 35% by warm=900.)
+    // Smoke should instead be moved by its OWN density -- that is what makes a plume
+    // billow, mushroom and curl back on itself instead of just leaving.
+    float dens = dot(texture(u_dye, uv).rgb, vec3(0.333));
+    // The lift has to REVERSE partway up, or this is only a slower jet: the smoke still
+    // stacks against the ceiling, it just takes 27s instead of 15s to empty the frame.
+    // The first attempt expressed cooling as its own constant and the crossover landed
+    // at uv.y=1.19 -- above the top of the frame, so lift was positive everywhere and
+    // the collapse survived. Express the CROSSOVER HEIGHT directly instead: lift is
+    // positive below u_hcross, negative above it, whatever the music does to u_buoy.
+    // That closes a convection cell inside the frame -- rise, cool, fall, recirculate --
+    // which is what holds a full, churning field instead of a column that leaves.
+    float lift = dens * u_buoy * (1.0 - uv.y/u_hcross);
+    vec2 v = texture(u_vel, uv).xy + force*u_dt + vec2(0.0, lift)*u_dt;
+    // Gentle drag. The pressure solve keeps the field divergence-free but does nothing
+    // about a net drift, so without this the updraft accumulates over a whole song.
+    v *= (1.0 - u_drag*u_dt);
+    fragColor = vec4(v, 0.0, 1.0);
   }`;
 
   const FRAG_FDIV = `${FLUID_HEAD}
@@ -2495,8 +2516,11 @@
       const p = 0.5 + sway*0.5;
       // base is deliberately high relative to the slope: the loud end already reads
       // well, it was the QUIET end that rendered as a near-black frame
-      const amp = (0.60 + S.bass*1.15) * fluidGain;
-      fV = fSplat(fVel, fV, p, 0.06, (Math.sin(fluidT*0.9))*90, 260*amp, 0, 0.0009);
+      const amp = (1.05 + S.bass*0.95) * fluidGain;
+      // The vertical kick is now a SEED, not a jet (was 260*amp). Buoyancy lifts the
+      // column from the dye itself, which is what gives it billow; firing it upward as
+      // well just returns to the uniform updraft that emptied the frame.
+      fV = fSplat(fVel, fV, p, 0.06, (Math.sin(fluidT*0.9))*90, 70*amp, 0, 0.0009);
       // the standing column drifts slowly through the walk; hits jump it
       const ink = fInk(S.c1, 0.35, amp*0.55);
       fD = fSplat(fDye, fD, p, 0.06, ink[0], ink[1], ink[2], 0.0011);
@@ -2544,8 +2568,17 @@
     gl.uniform2f(U(progFVort,'u_texel'), tx, ty);
     fTex(4, fVel[fV], progFVort, 'u_vel');
     fTex(5, fCurl,    progFVort, 'u_curl');
+    fTex(6, fDye[fD], progFVort, 'u_dye');
     gl.uniform1f(U(progFVort,'u_dt'), d);
     gl.uniform1f(U(progFVort,'u_vort'), 26.0 + S.coil*14.0);
+    // The smoke now drives itself: buoyancy scales with the music so a loud passage
+    // billows harder, and the height-cooling keeps the column turning over instead of
+    // stacking at the ceiling. Drag stops a net updraft accumulating over a whole song.
+    gl.uniform1f(U(progFVort,'u_buoy'), 210.0 + S.bass*180.0 + S.burst*160.0);
+    // the convection cell turns over at 62% of frame height -- high enough that the
+    // plume reads as rising, low enough that the fall-back is visible in frame.
+    gl.uniform1f(U(progFVort,'u_hcross'), 0.62);
+    gl.uniform1f(U(progFVort,'u_drag'), 1.0);
     drawQuad();
     fV = 1-fV;
 
@@ -2593,7 +2626,11 @@
     // dye has to fade or the frame saturates to a flat wall of colour within seconds
     // quiet passages hold their smoke (little turbulence to break it up); loud ones
     // clear faster so hits stay legible instead of piling into a wall of colour
-    gl.uniform1f(U(progFAdv,'u_diss'), 0.988 - S.bass*0.004 - S.beat*0.006);
+    // 0.988/frame is a HALVING every second at 60fps, which is why the field never
+    // accumulated into a full frame. With buoyancy recirculating the smoke instead of
+    // flushing it out the top, it can afford to live longer -- but only a little, or
+    // this becomes the flat wall of colour the dissipation exists to prevent.
+    gl.uniform1f(U(progFAdv,'u_diss'), 0.9945 - S.bass*0.004 - S.beat*0.006);
     drawQuad();
     fD = 1-fD;
   }
