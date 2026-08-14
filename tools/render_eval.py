@@ -26,11 +26,14 @@ OUT = os.path.abspath(os.environ.get(
 # It is not a code bug and it does not correlate with the state -- the same query
 # renders fine on a retry. Left unhandled it silently poisons a sweep: a black frame
 # measures as brightness ~0.2 / nonblack ~0, which reads as a plausible "the change
-# made everything dark" rather than as the failure it is. EVAL_WORKERS=1 also matters
-# for the heavy states (web geometry, 100k nebula sprites) -- 6-way parallelism on a
-# CPU rasteriser makes each render slow enough to hit the timeout, which produces
-# MORE black frames, so serial is both slower per sweep and more reliable per frame.
-WORKERS = int(os.environ.get("EVAL_WORKERS", "0")) or None
+# made everything dark" rather than as the failure it is.
+# Default 3, measured rather than guessed: 6 states of fluid took 8m00s at 3 workers
+# with ZERO blank-frame retries, against ~24 min serial. The old 6-way default is what
+# produced the 5-of-9 blank run that made a whole sweep unusable, and 1 was an
+# over-cautious reaction to it that cost ~3x for no reliability gain now that is_blank
+# and EVAL_RETRY exist. Override with EVAL_WORKERS for a heavier machine or a
+# web-geometry sweep (those are ~5x overdraw of translucent quads and much slower).
+WORKERS = int(os.environ.get("EVAL_WORKERS", "0")) or 3
 RETRIES = int(os.environ.get("EVAL_RETRY", "2"))
 # Taller window than the canvas needs: the control bar sits ABOVE the stage, so a
 # short window makes UI changes shrink the rendered preview and silently corrupt
@@ -163,7 +166,7 @@ def main():
     for i, (label, q) in enumerate(STATES):
         slug = "".join(c if c.isalnum() else "_" for c in label.lower())[:20]
         jobs.append((label, q, os.path.join(OUT, f"{i}_{slug}.png")))
-    workers = WORKERS or min(6, max(1, (os.cpu_count() or 4) // 2))
+    workers = max(1, min(WORKERS, os.cpu_count() or 4))
     if workers == 1:
         for j in jobs:
             render(j[1], j[2], RETRIES)

@@ -379,25 +379,70 @@
       let lo = 0;
       for (let k=-1;k<=1;k++) lo += eLow[clamp(f+k,0,F-1)];
       lowAt[i] = lo;
-      if (i > 0){
-        // cosine distance between the chroma either side of this beat
-        const a = f*12, b = clamp(beats[i-1],0,F-1)*12;
-        let d = 0, na = 0, nbv = 0;
-        for (let p=0;p<12;p++){ d += chroma[a+p]*chroma[b+p]; na += chroma[a+p]**2; nbv += chroma[b+p]**2; }
-        chgAt[i] = 1 - d/Math.max(1e-9, Math.sqrt(na*nbv));
-      }
     }
-    const lmax = Math.max(1e-9, Math.max.apply(null, Array.from(lowAt)));
-    let best = { meter: 4, phase: 0, score: -Infinity };
-    for (const meter of meterCandidates){
+    // Chroma change across this beat, averaged over the WHOLE beat either side rather
+    // than sampled at two single frames. A frame is 11.6ms at 86fps, which is far too
+    // short to characterise a chord: single-frame chroma is dominated by whatever
+    // transient happens to sit under it, so the change signal was mostly drum noise.
+    for (let i=1;i<nb;i++){
+      const f0 = clamp(beats[i-1], 0, F-1);
+      const f1 = clamp(beats[i], 0, F-1);
+      const f2 = clamp(i+1 < nb ? beats[i+1] : F-1, 0, F-1);
+      if (f1 <= f0 || f2 <= f1) continue;
+      const A = new Float64Array(12), B = new Float64Array(12);
+      for (let f=f0; f<f1; f++) for (let p=0;p<12;p++) A[p] += chroma[f*12+p];
+      for (let f=f1; f<f2; f++) for (let p=0;p<12;p++) B[p] += chroma[f*12+p];
+      let d = 0, na = 0, nbv = 0;
+      for (let p=0;p<12;p++){ d += A[p]*B[p]; na += A[p]*A[p]; nbv += B[p]*B[p]; }
+      chgAt[i] = 1 - d/Math.max(1e-9, Math.sqrt(na*nbv));
+    }
+    // Per-phase means, then each cue is weighted by how much it actually DISCRIMINATES.
+    //
+    // This is the four-on-the-floor fix. The old scorer added a fixed multiple of each
+    // cue, so a cue carrying no information still voted. With a kick on every beat the
+    // low-end means are flat to within ~2% across phases -- and the snare on 2 and 4
+    // leaks into the sub-200Hz band, so that 2% tilted the answer to beat 2 and the bar
+    // line came out one beat late on every four-on-the-floor track. Since that is the
+    // dominant pattern in the music this app is for, it was the common case failing.
+    // Scaling each cue by its own spread makes a flat cue contribute ~nothing, so the
+    // harmonic evidence decides when the drums genuinely cannot.
+    const spread = (arr, meter, ph0) => {
+      const m = [];
       for (let ph=0; ph<meter; ph++){
         let s = 0, c = 0;
-        for (let i=ph;i<nb;i+=meter){ s += lowAt[i]/lmax + 1.5*chgAt[i]; c++; }
-        s = c ? s/c : 0;
-        // gentle preference for 4/4 — most of what this app will ever see is in four
-        if (meter === 4) s *= 1.06;
-        if (s > best.score) best = { meter, phase: ph, score: s };
+        for (let i=ph; i<nb; i+=meter){ s += arr[i]; c++; }
+        m.push(c ? s/c : 0);
       }
+      const mx = Math.max.apply(null, m), mn = Math.min.apply(null, m);
+      const mean = m.reduce((a,b)=>a+b,0)/m.length;
+      return { means: m, rel: mean > 1e-9 ? (mx-mn)/mean : 0 };
+    };
+    // Cues are scaled by their GLOBAL mean (over every beat), not renormalised inside
+    // each meter. Renormalising per meter forces the best phase of every meter to the
+    // same value, which destroys any basis for comparing meters -- it picked 3/4 for a
+    // 4/4 track on the first attempt at this. Global scaling keeps the magnitudes
+    // comparable; the meter is then chosen by CONTRAST, since the right meter is the
+    // one whose phases actually differ from each other.
+    const gmean = (arr) => { let s = 0; for (let i=0;i<arr.length;i++) s += arr[i];
+                             return Math.max(1e-9, s/Math.max(1, arr.length)); };
+    const gL = gmean(lowAt), gC = gmean(chgAt);
+    // A cue with <8% relative spread across phases is noise, not evidence. Faded out
+    // rather than cut, so nothing hinges on a hard threshold.
+    const conf = r => Math.min(1, Math.max(0, (r - 0.08)/0.12));
+    let best = { meter: 4, phase: 0, score: -Infinity };
+    for (const meter of meterCandidates){
+      const L = spread(lowAt, meter), C = spread(chgAt, meter);
+      const wL = conf(L.rel), wC = 1.5*conf(C.rel);
+      const comb = [];
+      for (let ph=0; ph<meter; ph++)
+        comb.push(wL*(L.means[ph]/gL) + wC*(C.means[ph]/gC));
+      const mx = Math.max.apply(null, comb);
+      const mean = comb.reduce((a,b)=>a+b,0)/comb.length;
+      // contrast: how far the winning phase stands above the average phase
+      let sc = mx - mean;
+      // gentle preference for 4/4 — most of what this app will ever see is in four
+      if (meter === 4) sc *= 1.06;
+      if (sc > best.score) best = { meter, phase: comb.indexOf(mx), score: sc };
     }
     return best;
   }
