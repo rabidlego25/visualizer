@@ -2516,7 +2516,14 @@
       const p = 0.5 + sway*0.5;
       // base is deliberately high relative to the slope: the loud end already reads
       // well, it was the QUIET end that rendered as a near-black frame
-      const amp = (1.05 + S.bass*0.95) * fluidGain;
+      // The coil term is what stops tension emptying the frame: it feeds the field
+      // at the same time as the vorticity above tightens it. Zero at coil=0, so no
+      // other state moves. Measured full-res on COILED: level 18.1 -> 26.7 and,
+      // more importantly, spread 19.0 -> 5.3 -- the old COILED was OSCILLATING,
+      // which a single warm= screenshot cannot see (it samples one instant, so a
+      // pulsing field and a steady one are indistinguishable). Feed above ~0.6
+      // starts pulsing again, so this is not a 'more is better' knob.
+      const amp = (1.05 + S.bass*0.95 + S.coil*0.55) * fluidGain;
       // The vertical kick is now a SEED, not a jet (was 260*amp). Buoyancy lifts the
       // column from the dye itself, which is what gives it billow; firing it upward as
       // well just returns to the uniform updraft that emptied the frame.
@@ -2570,7 +2577,12 @@
     fTex(5, fCurl,    progFVort, 'u_curl');
     fTex(6, fDye[fD], progFVort, 'u_dye');
     gl.uniform1f(U(progFVort,'u_dt'), d);
-    gl.uniform1f(U(progFVort,'u_vort'), 26.0 + S.coil*14.0);
+    // coil raised vorticity and NOTHING else, which is backwards: confinement winds
+    // the dye into ever-thinner filaments, so tension read as the frame EMPTYING
+    // (13.7% coverage on the COILED state against 60.7% on quiet, despite quiet
+    // having a sixth of the bass). Slope halved, and the emitter now rises with coil
+    // too (below), so winding up tightens the structure instead of starving it.
+    gl.uniform1f(U(progFVort,'u_vort'), 26.0 + S.coil*8.0);
     // The smoke now drives itself: buoyancy scales with the music so a loud passage
     // billows harder, and the height-cooling keeps the column turning over instead of
     // stacking at the ceiling. Drag stops a net updraft accumulating over a whole song.
