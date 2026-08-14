@@ -292,6 +292,7 @@
     connect(sourceNode, true);
     playBtn.disabled=false; recBtn.disabled=false;
     fpReset(file.name);
+    director.analyse(file);
     hint.classList.add('hidden'); startLoop(); play();
   }
   async function useMic() {
@@ -305,6 +306,7 @@
       seek.disabled=true; seekbar.classList.add('disabled');
       curTime.textContent=durTime.textContent='0:00';
       fpReset('LIVE INPUT');
+      director.reset();
       hint.classList.add('hidden'); startLoop();
     } catch(e) { alert('Microphone access failed: '+e.message); }
   }
@@ -1611,6 +1613,164 @@
   let safe = false;
   function safeVal(){ return safe ? 0.2 : 1.0; }
 
+  // ---- the DIRECTOR: whole-song timeline -> the scene ------------------------
+  // listen() is CAUSAL. It only ever sees the last ~6s, so it can chase a drop but can
+  // never build toward one, and on a quiet passage its tempo lock drifts because there
+  // is nothing to lock to. analysis.js analyses the ENTIRE track before frame one
+  // (decodeAudioData hands over all the PCM the moment a file loads), so the structure
+  // can be READ OFF A TIMELINE instead of guessed from a meter.
+  //
+  // The split matters and is deliberate:
+  //   * SPECTRUM stays reactive. bass/mid/treb come from the live FFT every frame --
+  //     that is real per-frame texture the visuals are built on, and a timeline
+  //     resampled at 86Hz would be a downgrade, not an upgrade.
+  //   * STRUCTURE becomes directed. Beat grid, key, tension and release come from the
+  //     timeline, because those are exactly the things a 6-second window gets wrong.
+  //
+  // It is an OVERRIDE LAYER, never a replacement: mic input has no file to analyse, and
+  // a file is playing for a second or two before its analysis lands. Both must look
+  // exactly as they do today, so everything below no-ops until `ready`.
+  // Worker construction is blocked outright on file://, and there is no feature test
+  // for that short of trying it, so decide up front. `?worker=0` forces the inline path
+  // for headless verification (see analyseInline).
+  let dirNoWorker = (typeof Worker === 'undefined') || location.protocol === 'file:'
+                    || new URLSearchParams(location.search).get('worker') === '0';
+  const director = {
+    ready: false, tl: null, worker: null, status: '', failed: false,
+    _beatAt: 0, _drops: [], _builds: [], _lastBurstT: -1,
+    reset(){
+      this.ready = false; this.tl = null; this.status = ''; this.failed = false;
+      this._drops = []; this._builds = []; this._lastBurstT = -1;
+      if (this.worker){ this.worker.terminate(); this.worker = null; }
+    },
+    // Kick off analysis alongside playback. Deliberately fire-and-forget: the track is
+    // already playing by the time this resolves, and a failure here must never stop the
+    // visualizer -- it just means we stay on the realtime path.
+    analyse(file){
+      this.reset();
+      this.status = 'ANALYSING';
+      file.arrayBuffer()
+        .then(buf => audioCtx.decodeAudioData(buf))
+        .then(ab => {
+          const left = ab.getChannelData(0);
+          const right = ab.numberOfChannels > 1 ? ab.getChannelData(1) : null;
+          if (dirNoWorker) return this.analyseInline(left, right, ab.sampleRate);
+          const w = new Worker('analysis-worker.js');
+          this.worker = w;
+          w.onmessage = e => {
+            if (e.data.type === 'done')      this.adopt(e.data.result);
+            else if (e.data.type === 'error'){ this.status = ''; this.failed = true; }
+          };
+          w.onerror = () => { this.status = ''; this.failed = true; };
+          // Transfer the PCM rather than copying it: a 4-minute stereo track is ~80 MB,
+          // and structured-cloning that costs more than a slice of the analysis itself.
+          const l = new Float32Array(left), r = right ? new Float32Array(right) : null;
+          const xfer = r ? [l.buffer, r.buffer] : [l.buffer];
+          w.postMessage({ left: l, right: r, sampleRate: ab.sampleRate }, xfer);
+        })
+        .catch(() => { this.status = ''; this.failed = true; });
+    },
+    // Main-thread fallback. The Worker exists to keep the page from freezing for a
+    // couple of seconds right after the user hands us their track, so this is NOT the
+    // preferred path -- but there are two cases where the Worker is simply unavailable
+    // and a brief freeze beats losing the feature entirely:
+    //   * file:// — Chrome blocks Worker construction from a file URL, and opening
+    //     eva.html straight off disk is a supported way to run this locally.
+    //   * a headless browser under --virtual-time-budget, whose virtual clock races
+    //     past a Worker running on the real one (the same trap analyze.html documents
+    //     with &worker=0). tools/test_director_e2e.mjs relies on this.
+    // analysis.js is fetched on demand rather than shipped in every page load, since
+    // the Worker path never needs it on the main thread.
+    analyseInline(left, right, sampleRate){
+      const run = () => {
+        try { this.adopt(self.SongAnalysis.analyzeSong({ left, right, sampleRate })); }
+        catch (e){ this.status = ''; this.failed = true; }
+      };
+      if (self.SongAnalysis) { setTimeout(run, 0); return; }
+      const s = document.createElement('script');
+      s.src = 'analysis.js';
+      s.onload = () => setTimeout(run, 0);
+      s.onerror = () => { this.status = ''; this.failed = true; };
+      document.head.appendChild(s);
+    },
+    adopt(tl){
+      if (!tl || !tl.ok || !tl.beats || tl.beats.length < 8){ this.status=''; this.failed=true; return; }
+      this.tl = tl; this.ready = true; this.status = '';
+      this._beatAt = 0;
+      this._drops  = (tl.events||[]).filter(e => e.type === 'drop');
+      this._builds = (tl.events||[]).filter(e => e.type === 'build_start');
+      // Each beat's position within its bar, resolved ONCE here rather than by scanning
+      // the beat list every frame. It also makes the bar exact instead of assuming a
+      // 4/4 origin at t=0 -- an intro of 3 bars, or any pickup, and an assumed origin
+      // puts every bar pip on the wrong beat for the whole song.
+      const dbs = tl.downbeats || [], meter = (tl.tempo && tl.tempo.meter) || 4;
+      this._beatPos = new Uint8Array(tl.beats.length);
+      let dbi = 0, pos = 0;
+      for (let k=0;k<tl.beats.length;k++){
+        while (dbi < dbs.length && dbs[dbi] <= tl.beats[k] + 1e-3){ dbi++; pos = 0; }
+        this._beatPos[k] = pos % meter;
+        pos++;
+      }
+      if (this.worker){ this.worker.terminate(); this.worker = null; }
+    },
+    sectionAt(t){
+      const ss = this.tl.sections || [];
+      for (let i=0;i<ss.length;i++) if (t >= ss[i].start && t < ss[i].end) return ss[i];
+      return ss.length ? ss[ss.length-1] : null;
+    },
+    // The whole point of the exercise: how close is the playhead to the NEXT drop, as
+    // 0..1 over the build that leads into it. A causal tracker cannot produce this
+    // number at all -- it is the one thing that needs to know the future.
+    approach(t){
+      let best = 0;
+      for (let i=0;i<this._drops.length;i++){
+        const d = this._drops[i];
+        if (d.t <= t) continue;
+        // Prefer an actual BUILD section as the ramp's start; fall back to a fixed
+        // 8-second run-up so a drop with no labelled build still gets an approach.
+        let from = d.t - 8;
+        for (let j=0;j<this._builds.length;j++){
+          const b = this._builds[j];
+          if (b.t < d.t && b.t > from && (b.until === undefined || b.until >= d.t - 0.5)) from = b.t;
+        }
+        if (t < from) break;                       // events are in time order
+        best = Math.max(best, (t - from)/Math.max(0.5, d.t - from));
+        break;
+      }
+      return Math.min(1, Math.max(0, best));
+    },
+    // Sample the timeline at song time t. Returns null when not ready, so every caller
+    // reads as "timeline if we have one, else exactly what we did before".
+    sample(t){
+      if (!this.ready) return null;
+      const tl = this.tl, beats = tl.beats;
+      // walk the cached cursor; seeking backwards resets it. O(1) amortised per frame.
+      let i = this._beatAt;
+      if (i >= beats.length || beats[i] > t) i = 0;
+      while (i+1 < beats.length && beats[i+1] <= t) i++;
+      this._beatAt = i;
+      const cur = beats[i], nxt = (i+1 < beats.length) ? beats[i+1] : cur + tl.tempo.beatPeriod;
+      const phase = Math.min(1, Math.max(0, (t - cur)/Math.max(1e-3, nxt - cur)));
+      const sec = this.sectionAt(t);
+      const app = this.approach(t);
+      // beat strength from the grid, shaped to the same ~0.4..1.25 range analyze()
+      // produces, so every downstream constant tuned against the realtime path still holds.
+      const bs = (tl.beatStrength && tl.beatStrength[i] != null) ? tl.beatStrength[i] : 0.6;
+      return {
+        bpm: tl.tempo.bpm, bpmConf: Math.max(tl.tempo.confidence, 0.75),
+        beatPeriod: tl.tempo.beatPeriod,
+        beatPhase: phase, beatCount: this._beatPos ? this._beatPos[i] : 0,
+        beatStrength: 0.4 + Math.min(1, bs)*0.85,
+        beatT: cur,
+        approach: app,
+        section: sec, label: sec ? sec.label : '',
+        keyIdx: tl.key && tl.key.tonicIdx >= 0 ? tl.key.tonicIdx : -1,
+        keyConf: tl.key ? (tl.key.confidence != null ? tl.key.confidence : 0.6) : 0,
+        drop: this._drops.find(d => Math.abs(d.t - t) < 0.12) || null
+      };
+    }
+  };
+
   // ---- deeper listening: onsets, tempo, key ----------------------------------
   // The bass-only detector could REACT but never ANTICIPATE, and it went nearly deaf
   // on tracks without a kick. Spectral flux gives broadband onsets; autocorrelating
@@ -1774,8 +1934,52 @@
     const target = 0.55 + 0.42*Math.min(1, Math.pow(syncSmooth*1.5, 0.8)) + syncWander*0.04;
     syncRatio += (target - syncRatio) * 0.07;
     syncRatio = Math.max(0.35, Math.min(0.999, syncRatio));
+    directTick(now, dt, energy);
     return { bass, mid, treb, energy };
   }
+
+
+  // Replace the CAUSAL structure signals with the timeline's, when we have one.
+  // Everything here writes the same variables listen()/analyze() already write, so no
+  // downstream code has to know which path it is on -- and if the timeline never
+  // arrives, none of it runs and the app behaves exactly as it did before Stage 2.
+  function directTick(now, dt, energy){
+    const t = mediaEl && !mediaEl.paused ? mediaEl.currentTime : (mediaEl ? mediaEl.currentTime : 0);
+    const d = director.sample(t);
+    if (!d) return;
+    // --- grid: exact, and global. This is the thing the realtime tracker structurally
+    // cannot do -- its lock drifts through any passage with nothing to lock onto.
+    bpm = d.bpm; bpmConf = d.bpmConf; beatPeriod = d.beatPeriod;
+    beatPhase = d.beatPhase; beatCount = d.beatCount;
+    barPhase = (d.beatCount + d.beatPhase)/4;
+    // --- beat: fire ON the grid line rather than when the bass envelope happens to
+    // cross a threshold. Same 0.4..1.25 range, so every constant tuned downstream holds.
+    if (d.beatT > dirLastBeatT + 1e-3){
+      dirLastBeatT = d.beatT;
+      beat = Math.max(beat, d.beatStrength);
+    }
+    // --- key: one global estimate over the whole track instead of a 6-second chroma
+    // that wanders between relative major and minor.
+    if (d.keyIdx >= 0){
+      keyIdx = d.keyIdx; keyConf = Math.max(keyConf, 0.6);
+      const ang = d.keyIdx/12 * Math.PI*2;
+      hueX = Math.cos(ang); hueY = Math.sin(ang);
+      harmHue = Math.atan2(hueY, hueX) * 0.28;
+    }
+    // --- THE POINT: tension ANTICIPATES. coil is driven by how close the playhead is
+    // to the next drop, so the scene winds up THROUGH a build and is fully coiled when
+    // the drop lands. The causal version could only start reacting once the drop had
+    // already happened, which is a frame or two too late to read as intent.
+    // max() against the reactive value, so a loud unlabelled passage still breathes.
+    coil = Math.max(coil*0.5, Math.min(1, d.approach));
+    // --- release fires exactly on the boundary the analysis found, once.
+    if (d.drop && d.drop.t !== director._lastBurstT){
+      director._lastBurstT = d.drop.t;
+      burst = Math.min(1.5, burst + 0.6 + d.drop.strength*0.9);
+      coil *= 0.25;
+    }
+  }
+  let dirLastBeatT = -1;
 
   // ---------------- Neural web (geometry fed to the GPU each frame) ----------------
   // The web is a real FORCE-DIRECTED GRAPH now: nodes carry velocity and are pushed
@@ -2787,7 +2991,17 @@
   function musicReadout(a, now){
     const tot = a.bass + a.mid + a.treb + 1e-3;
     let label, pri;
-    if (burst > 0.4)              { label='RELEASE // DROP';  pri=5; }
+    const dl = director.ready ? director.sample(mediaEl ? mediaEl.currentTime : 0) : null;
+    // Surface whether the scene is being DIRECTED or merely reacting. Without this
+    // there is no way to tell from the outside which path is live -- and the two look
+    // similar on a steady passage, so a silently-failed analysis (file:// blocks the
+    // Worker, an unsupported codec) would just look like the feature doing nothing.
+    if (director.status)          { label=director.status;    pri=6; }
+    else if (burst > 0.4)         { label='RELEASE // DROP';  pri=5; }
+    else if (dl && dl.approach > 0.55) { label='DROP IMMINENT';  pri=5; }
+    else if (dl && dl.label === 'BUILD')     { label='BUILD // WINDING';  pri=4; }
+    else if (dl && dl.label === 'BREAKDOWN') { label='BREAKDOWN';         pri=4; }
+    else if (dl && dl.label === 'CHORUS')    { label='CHORUS // SUSTAIN'; pri=4; }
     else if (coil > 0.5)          { label='TENSION RISING';   pri=4; }
     else if (coil > 0.25)         { label='CHARGING';         pri=3; }
     else if (energyFast < 0.12)   { label='SIGNAL LOW';       pri=3; }
@@ -3343,6 +3557,24 @@
     // assistant can screenshot specific states headlessly and measure them.
     // e.g. eva.html?test=1&bass=0.9&beat=1&theme=4&t=2  or &safe=1
     const P = new URLSearchParams(location.search);
+    // `?e2e=<url>` — fetch a track and push it through the REAL load path, then expose
+    // the director's state. The unit harness (tools/test_director.mjs) covers the
+    // director's logic by feeding it a timeline directly; this exists to cover the one
+    // seam it cannot reach, which is the seam Stage 2 actually added:
+    // file -> arrayBuffer -> decodeAudioData -> Worker -> adopt(). Integration bugs
+    // live in glue, so the glue needs a way to be driven from outside.
+    if (P.has('e2e')) {
+      window.__dirState = () => ({
+        ready: director.ready, failed: director.failed, status: director.status,
+        bpm: director.tl ? director.tl.tempo.bpm : 0,
+        beats: director.tl ? director.tl.beats.length : 0,
+        sections: director.tl ? director.tl.sections.length : 0
+      });
+      fetch(P.get('e2e'))
+        .then(r => r.arrayBuffer())
+        .then(b => loadFile(new File([b], 'e2e.wav', { type: 'audio/wav' })))
+        .catch(e => { window.__e2eErr = String(e && e.message || e); director.failed = true; });
+    }
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
       if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
