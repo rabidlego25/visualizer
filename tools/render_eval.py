@@ -22,6 +22,16 @@ EVA = "file://" + os.path.abspath(os.environ.get(
     "EVA_FILE", os.path.join(os.path.dirname(__file__), "..", "eva.html")))
 OUT = os.path.abspath(os.environ.get(
     "EVAL_OUT", os.path.join(os.path.dirname(__file__), "..", "scratchpad_eval")))
+# Software WebGL intermittently hands back a frame with nothing but the HUD on it.
+# It is not a code bug and it does not correlate with the state -- the same query
+# renders fine on a retry. Left unhandled it silently poisons a sweep: a black frame
+# measures as brightness ~0.2 / nonblack ~0, which reads as a plausible "the change
+# made everything dark" rather than as the failure it is. EVAL_WORKERS=1 also matters
+# for the heavy states (web geometry, 100k nebula sprites) -- 6-way parallelism on a
+# CPU rasteriser makes each render slow enough to hit the timeout, which produces
+# MORE black frames, so serial is both slower per sweep and more reliable per frame.
+WORKERS = int(os.environ.get("EVAL_WORKERS", "0")) or None
+RETRIES = int(os.environ.get("EVAL_RETRY", "2"))
 # Taller window than the canvas needs: the control bar sits ABOVE the stage, so a
 # short window makes UI changes shrink the rendered preview and silently corrupt
 # every measurement. Give the stage room so metrics track the visuals, not the layout.
@@ -63,7 +73,38 @@ STATES = [
     ("neb TRAILS (anim)",       "test=1&res=540&trails=1&anim=45&mode=nebula&bass=0.7&mid=0.5&treb=0.4&beat=0.8&theme=2&t=4&warm=150"),
 ]
 
-def render(query, png):
+def is_blank(png):
+    """True if the render came back as HUD-only (the SwiftShader flake).
+
+    Measured on the CENTRE of the stage, not the whole window and not crop_frame().
+    The whole window does not separate the two cases: the NERV chrome alone lights
+    8.9% of it, against 12.1% for a legitimately quiet nebula -- far too tight to
+    threshold. crop_frame() is worse, because it takes the bounding box of everything
+    lit, so on a blank frame it crops down to the HUD and hands back something that
+    measures like a perfectly normal image. The middle of the stage is where the HUD
+    chrome is not and where every mode puts its subject, so it separates cleanly:
+    blank frames measure exactly 0.000, the dimmest real frame in any sweep measures
+    0.185, and the web states sit at 0.37-0.67.
+    """
+    if not os.path.exists(png):
+        return True
+    im = Image.open(png).convert("L")
+    stage = im.crop((0, 0, im.width, int(im.height*0.78)))
+    w, h = stage.size
+    mid = stage.crop((int(w*0.35), int(h*0.35), int(w*0.65), int(h*0.65))).resize((80, 80))
+    px = list(mid.getdata())
+    return sum(1 for v in px if v > 10) / len(px) < 0.03
+
+def render(query, png, retries=0):
+    for attempt in range(retries + 1):
+        _render_once(query, png)
+        if not is_blank(png):
+            return
+        if attempt < retries:
+            print(f"  blank frame, retrying ({attempt+1}/{retries}): {query[:60]}",
+                  file=sys.stderr)
+
+def _render_once(query, png):
     # Delete first. A failed/timed-out render leaves the PREVIOUS run's file in place,
     # and measure() would happily report it as the current one -- stale numbers that
     # look plausible are far worse than a loud RENDER FAILED.
@@ -122,15 +163,24 @@ def main():
     for i, (label, q) in enumerate(STATES):
         slug = "".join(c if c.isalnum() else "_" for c in label.lower())[:20]
         jobs.append((label, q, os.path.join(OUT, f"{i}_{slug}.png")))
-    workers = min(6, max(1, (os.cpu_count() or 4) // 2))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(lambda j: render(j[1], j[2]), jobs))
+    workers = WORKERS or min(6, max(1, (os.cpu_count() or 4) // 2))
+    if workers == 1:
+        for j in jobs:
+            render(j[1], j[2], RETRIES)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda j: render(j[1], j[2], RETRIES), jobs))
 
     print(f"{'state':26} {'brightness':>11} {'clipped%':>9} {'nonblack%':>10}")
     print("-"*60)
     for label, q, png in jobs:
         if not os.path.exists(png):
             print(f"{label:26}  RENDER FAILED"); continue
+        if is_blank(png):
+            # Report it, don't measure it. A blank frame's numbers are indistinguishable
+            # from "the change made the scene disappear", which is the wrong conclusion
+            # to hand back after an unattended sweep.
+            print(f"{label:26}  BLANK (swiftshader flake, retries exhausted)"); continue
         im, L, clip, nb = measure(png)
         print(f"{label:26} {L:11.1f} {clip:9.1f} {nb:10.1f}")
         results.append((label, L, clip, nb))

@@ -950,9 +950,15 @@
     col += vec3(0.7,0.8,1.0) * st * (0.35 + 0.4*sin(t*2.0 + h21(sp)*40.0)) * 0.7;
     // the singularity the cloud orbits: swells on bass, flares on the release.
     // Restrained on purpose -- it sits dead centre, so any excess reads as a white blob.
-    float coreR = 0.032 + u_bass*0.045 + u_burst*0.04;
-    col += mix(u_c1, vec3(1.0,0.93,0.78), 0.5) * smoothstep(coreR, 0.0, d) * (0.55 + u_beat*0.35);
-    col += u_c1 * smoothstep(coreR*8.0, 0.0, d) * (0.10 + u_bass*0.22 + u_coil*0.20);
+    // Brightness bug shape (a) lived HERE, and it is what made the nebula read as "a
+    // bright core": the halo's RADIUS was coreR*8.0 with coreR itself growing on
+    // bass/burst, so it reached 0.29uv when quiet, 0.56uv loud and 0.96uv on a drop --
+    // against a frame whose corner is only 0.574uv. Past ~0.57 there is no falloff left
+    // anywhere on screen, so the "glow" was a flat wash over the whole image and the
+    // particles disappeared into it. Radius is FIXED now; only the amplitude reacts.
+    float coreR = 0.030 + u_bass*0.018;
+    col += mix(u_c1, vec3(1.0,0.93,0.78), 0.5) * smoothstep(coreR, 0.0, d) * (0.50 + u_beat*0.30);
+    col += u_c1 * smoothstep(0.26, 0.0, d) * (0.05 + u_bass*0.09 + u_coil*0.09);
     col *= smoothstep(1.45, 0.25, d);                 // hold the frame's edges dark
     fragColor = vec4(col * u_exposure, 1.0);
   }`;
@@ -1007,9 +1013,15 @@
     curl -= axis * dot(curl, axis) * 0.80;
     vec3 acc = curl;
     vec3 tang = normalize(cross(pos, axis) + vec3(1e-5));
-    // Keplerian-ish falloff: inner material visibly outruns the outer. That shear is
-    // the signature that makes a rotating body read as ONE body.
-    acc += tang * u_swirl / sqrt(0.30 + r);
+    // Rotation curve. Shear is what makes a rotating body read as ONE body, but the
+    // old profile (u_swirl/sqrt(0.30+r)) is MAXIMAL at r=0: the innermost material
+    // spun fastest and was centrifugally thrown out of the middle, hollowing the disc
+    // into a ring with a dark gap around the nucleus. Real discs rotate as a SOLID
+    // BODY through the bulge (v ~ r) and only fall off outside it. r/(k + r^1.5) is
+    // linear at small r and ~r^-0.5 outside, so the Keplerian-ish shear survives where
+    // it is visible. Measured: centre density up ~60% and the gap closes.
+    // (r*sqrt(r), not pow(r,1.5) -- cheaper, and defined at r=0 on every driver.)
+    acc += tang * u_swirl * r / (1.80 + r*sqrt(r));
     // Collapse toward the disc plane. A uniform ball of noise is the least structured
     // shape there is; a disc has an axis, a silhouette and a direction of travel.
     acc -= axis * dot(pos, axis) * u_disc;
@@ -1026,10 +1038,17 @@
     vec3  inPl = pos - axis*hAx;
     float rp   = length(inPl);
     vec3  dirP = inPl / max(rp, 1e-4);
-    float rTarget = u_shell * (0.20 + 1.35*pow(seed, 0.34));
-    acc -= dirP * (rp - rTarget) * 2.2;                      // soft spring: the flow still wins
+    // seed^0.34 is r ~ u^(1/3): the exponent that fills a SPHERE evenly. It is left
+    // over from when this was a ball, and on a disc it under-fills the middle and
+    // over-fills the rim -- a hollow ring. A disc is 2D, so it wants r ~ u^(1/2).
+    float rTarget = u_shell * 1.35 * pow(seed, 1.1);
+    // Stiff spring, and it has to be: the outward term below is a CONSTANT force, not
+    // an impulse, so every particle parks at rest offset = force/spring beyond its
+    // target radius. At the old 2.2 against a beat push of 7.0 that offset was larger
+    // than the cloud itself, which is how 67% of the particles ended up off-canvas.
+    acc -= dirP * (rp - rTarget) * 8.5;
     // beats punch it outward, the drop detonates it
-    acc += dirP * (u_beat*u_beat*7.0 + u_burst*15.0 + e*1.6) * u_safe;
+    acc += dirP * (u_beat*u_beat*0.8 + u_burst*2.5 + e*0.35) * u_safe;
     // cursor: drag hauls the cloud in, hover shoulders it aside (matches the web).
     // JS un-rotates the cursor by the camera yaw first, so this is a real world-space
     // point under the pointer -- comparing screen xy to world xy drifts as the camera turns.
@@ -1049,7 +1068,10 @@
     pos += vel*dt;
 
     life -= dt * (0.09 + seed*0.10);
-    if (life <= 0.0 || r > 3.4){                            // recycle: reseed near the shell
+    // escape radius tracks the (now much smaller) cloud -- at the old 3.4 it sat far
+    // outside anything the sim produces, so a particle flung out never came back
+    // except by ageing out, and spent seconds streaking across an empty frame.
+    if (life <= 0.0 || r > 1.8){                            // recycle: reseed near the shell
       vec3 h = hash33(vec3(seed*97.3, u_time, float(gl_VertexID)*0.017));
       float th = h.x*6.2831853, ph = acos(2.0*h.y - 1.0);
       // reseed INTO the disc: a spherical reseed constantly refills the volume the
@@ -1116,12 +1138,20 @@
     float shock = exp(-abs(rr - u_shockR)*7.0) * u_shockA;
     vec3 col = mix(u_c2, u_c1, clamp(e*1.6 + spd*0.30, 0.0, 1.0));
     col = hueShift(col, u_hue + spd*0.22 + a_dat.y*0.25);
-    col += vec3(1.0,0.94,0.82) * smoothstep(1.1, 2.8, spd) * 0.7;      // hot fast streaks
+    // hot fast streaks. Threshold raised with the rebuild: mean speed measured 2.4-3.3
+    // now (was ~1.8), so at the old 1.1..2.8 window this fired on nearly every particle
+    // and stopped being a highlight at all.
+    col += vec3(1.0,0.94,0.82) * smoothstep(2.6, 5.0, spd) * 0.7;
     col += mix(u_c1, vec3(1.0,0.96,0.88), 0.5) * shock * 1.6;          // shockwave crest
     float depth = smoothstep(7.0, 1.0, z);                             // far particles recede
     // per-particle brightness stays LOW: with 100k+ additive sprites the image is built
     // by accumulation, and anything per-sprite gets multiplied by the overlap count.
-    v_col = vec4(col * (0.08 + e*0.38 + u_burst*0.25 + u_coil*0.10) * dens,
+    // Per-sprite brightness comes DOWN as the cloud comes into frame, which is not a
+    // contradiction: 33% -> ~88% on canvas, concentrated into a much smaller screen
+    // area, is roughly 4x the on-screen particle density, and these are additive, so
+    // brightness gets multiplied by the overlap count. Same trap as the nebula's
+    // radius distribution -- fixing the geometry is what forces the photometry down.
+    v_col = vec4(col * (0.028 + e*0.135 + u_burst*0.09 + u_coil*0.035) * dens,
                  fade*depth*u_exposure);
   }`;
   const FRAG_PTS = `#version 300 es
@@ -2375,8 +2405,11 @@
   // expanding beat ring: reset to the centre on a hit, then sweeps outward and fades
   let shockR = 9, shockA = 0;
   function shockTick(S, dt){
-    if (S.beat > 0.45 && shockA < S.beat*0.6){ shockR = 0.05; shockA = S.beat*0.9*S.safe; }
-    shockR += dt * 2.6;
+    if (S.beat > 0.45 && shockA < S.beat*0.6){ shockR = 0.02; shockA = S.beat*0.9*S.safe; }
+    // 2.6/s crossed the old 3.3-radius cloud in ~1.3s. The cloud's outer edge is ~1.5
+    // now, so keep the crossing time rather than the speed, or the one synchronised
+    // event the whole cloud takes part in is over before the eye catches it.
+    shockR += dt * 1.15;
     shockA *= Math.pow(0.35, dt);
   }
   function particleTarget(){
@@ -2397,9 +2430,12 @@
     const pos = new Float32Array(PCOUNT*3), vel = new Float32Array(PCOUNT*3), dat = new Float32Array(PCOUNT*3);
     for (let i=0;i<PCOUNT;i++){
       const th = Math.random()*Math.PI*2, ph = Math.acos(2*Math.random()-1);
-      const rad = 0.20 + Math.pow(Math.random(), 0.34)*0.95;   // even fill, see rTarget
+      // Match rTarget's distribution AND its scale, or frame one is a fat ball at the
+      // old radius that visibly collapses over the first second of every load.
+      // sqrt() = even areal fill for a DISC (see rTarget); 0.52 ~ u_shell*1.35.
+      const rad = Math.pow(Math.random(), 1.1)*0.54;
       pos[i*3]   = Math.sin(ph)*Math.cos(th)*rad;
-      pos[i*3+1] = Math.cos(ph)*rad*0.75;          // slightly squashed -> a thick disc
+      pos[i*3+1] = Math.cos(ph)*rad*0.18;          // squashed -> seeded as a disc, not a ball
       pos[i*3+2] = Math.sin(ph)*Math.sin(th)*rad;
       vel[i*3]   = (Math.random()-0.5)*0.2;
       vel[i*3+1] = (Math.random()-0.5)*0.1;
@@ -2445,14 +2481,31 @@
     gl.uniform1f(U(progSim,'u_safe'), S.safe);
     // the cloud's target radius: swells with bass, is reeled IN as tension winds up,
     // and is thrown wide open by the release -- the breathing the web already does.
-    gl.uniform1f(U(progSim,'u_shell'), 1.18 + S.bass*0.55 + S.burst*0.45 - S.coil*0.35);
-    gl.uniform1f(U(progSim,'u_flow'),  1.15 + S.treb*0.85 + S.coil*0.70);
-    // rotation now leads: it was 1.50 against a curl field several times stronger
-    gl.uniform1f(U(progSim,'u_swirl'), 5.20 + S.treb*2.2 + S.coil*3.2 + S.beat*1.6);
+    // Radius is ~2.7x smaller than it was. VERT_PTS multiplies x by u_res.y/u_res.x
+    // (1.78 at 9:16), so the HORIZONTAL cut is the binding one and particles are only
+    // on canvas out to rp ~ 1.28. The old constants settled at rp_mean 2.32, which put
+    // just 33% of the cloud in frame -- the near half flew off the sides entirely and
+    // the far half foreshortened into a gritty band along the bottom edge. That, not
+    // the flow field, is why it read as scatter instead of an object. Now ~88%, the
+    // same bar the force-directed web is held to. Verified in scratchpad/sim_neb.py.
+    gl.uniform1f(U(progSim,'u_shell'), 0.32 + S.bass*0.15 + S.burst*0.12 - S.coil*0.095);
+    // Higher spatial frequency than before *because* the world shrank: u_flow scales
+    // pos into the curl field, so keeping the old value would have sampled one smooth
+    // lobe across the whole cloud. Measured coherence is better here too (3.6 vs 2.8).
+    gl.uniform1f(U(progSim,'u_flow'),  3.60 + S.treb*1.70 + S.coil*1.40);
+    // rotation now leads: it was 1.50 against a curl field several times stronger.
+    // Rescaled for the solid-body rotation curve above, whose peak sits lower than
+    // the old 1/sqrt(r) did -- same apparent spin, without evacuating the middle.
+    gl.uniform1f(U(progSim,'u_swirl'), 9.90 + S.treb*3.4 + S.coil*5.2 + S.beat*2.5);
     // disc thickness: flares open on bass and on the release, never fully flat
     // a LENS, not a wafer: enough to give it an axis and a silhouette, not so much
-    // that it collapses to a transparent sheet
-    gl.uniform1f(U(progSim,'u_disc'), 1.7 - S.bass*0.7 - S.burst*1.1);
+    // that it collapses to a transparent sheet.
+    // CLAMPED, and the clamp is load-bearing: the old expression went NEGATIVE on a
+    // drop (1.7 - 0.9*0.7 - 1.2*1.1 = -0.25), which flips `acc -= axis*dot(pos,axis)*
+    // u_disc` into an anti-restoring force AND turns the axial velocity damping below
+    // into axial velocity GAIN. The cloud detonated along its own axis on every drop --
+    // that is the vertical streak in the BURST frame.
+    gl.uniform1f(U(progSim,'u_disc'), Math.max(0.30, 0.40 - S.bass*0.16 - S.burst*0.26));
     // put the cursor into world space on the camera plane (undo the render yaw), so the
     // particles it grabs are the ones actually under the pointer
     const yaw = S.t*0.075 + S.bass*0.22, mx = mouse.x*2.4;
