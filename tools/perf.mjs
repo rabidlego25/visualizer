@@ -48,17 +48,32 @@ const srv = http.createServer((req, res) => {
 await new Promise(r => srv.listen(PORT, r));
 
 const prof = fs.mkdtempSync(path.join(os.tmpdir(), 'evaperf-'));
+// Chrome throttles OCCLUDED and BACKGROUNDED windows. A window spawned from a terminal
+// never gets focus, so without these flags every measurement reads ~30fps regardless of
+// what the page does -- a blank page measured 33.3ms too, which is how this was caught.
 const args = ['--no-first-run', `--user-data-dir=${prof}`, '--disable-background-networking',
               '--disable-default-apps', '--no-default-browser-check', '--disable-component-update',
-              '--autoplay-policy=no-user-gesture-required', '--window-size=1100,1200'];
+              '--autoplay-policy=no-user-gesture-required', '--window-size=1100,1200',
+              '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+              '--disable-background-timer-throttling', '--disable-features=CalculateNativeWinOcclusion'];
 
 // mirror adaptResolution(): snap the observed floor to a real refresh period, so the
 // verdict is judged against what the DISPLAY can deliver rather than a hardcoded 60Hz.
 const vsGuess = (ms) => [6.94, 8.33, 11.11, 16.67, 33.34]
   .reduce((b, h) => Math.abs(ms - h) < Math.abs(ms - b) ? h : b, 16.67);
+// never leave a browser behind, even on ctrl-c
+const kids = new Set();
+const reap = () => { for (const c of kids) { try { c.kill('SIGKILL'); } catch {} } kids.clear(); };
+process.on('exit', reap); process.on('SIGINT', () => { reap(); process.exit(130); });
+process.on('uncaughtException', e => { reap(); console.error(e); process.exit(1); });
+
 const pct = (a, p) => a.length ? a.slice().sort((x,y)=>x-y)[Math.min(a.length-1, Math.floor(a.length*p))] : NaN;
 
-console.log(`measuring ${SECS}s per engine on the real GPU  (renderScale starts at 1.0)\n`);
+// HONEST LIMIT: Chrome throttles occluded windows to ~30fps, and a window spawned from a
+// terminal never gets focus. A blank page measures 33.3ms here for exactly that reason, so
+// these fps figures are a FLOOR, not the app's real cost. Raising the window would fix the
+// number and steal focus, which is not worth it -- use ?fps=1 in a normal browser instead.
+console.log(`measuring ${SECS}s per engine  (occluded window: fps is a floor, see header)\n`);
 console.log('engine    canvas       fps  p50 ms  p95 ms   worst   scale  verdict');
 const results = [];
 for (const eng of ENGINES) {
@@ -67,8 +82,9 @@ for (const eng of ENGINES) {
   const url = eng==='blank' ? `http://localhost:${PORT}/scratchpad/perfctl/blank.html`
     : `http://localhost:${PORT}/${PAGE}?mode=${eng}&perf=/__perf&hud=0${RES?`&res=${RES}`:''}${AUDIO?`&e2e=${AUDIO}`:''}`;
   const ch = spawn(CHROME, [...args, url], { stdio: 'ignore' });
+  kids.add(ch);
   await new Promise(r => setTimeout(r, SECS * 1000));
-  ch.kill();
+  ch.kill(); kids.delete(ch);
   // drop the first ~2s: shader compile, lazy target allocation and the fluid's first
   // frames are startup cost, not steady state, and they drag every percentile.
   const warm = frames.slice(Math.min(frames.length - 1, 120));

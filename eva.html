@@ -3940,6 +3940,41 @@
         rq.open('GET', P.get('beatsrc'), false); rq.send(null);
         try { beatSched = JSON.parse(rq.responseText).beats; } catch(e){ beatSched = null; }
       }
+      // `?bench=N` — render N frames BACK TO BACK with no rAF and a gl.finish() per
+      // frame, and report the true cost. This exists because frame RATE is not frame
+      // COST: Chrome throttles occluded windows to ~30fps, so any rAF-based measurement
+      // from a harness reads 33.3ms no matter what the page does (a page rendering
+      // nothing measures the same). gl.finish() blocks until the GPU has actually
+      // retired the work, so this is the real number and it is immune to vsync,
+      // occlusion and compositor throttling.
+      if (P.has('bench')){
+        const N = Math.max(4, tp('bench', 60)|0);
+        const ts = [], benchPx = new Uint8Array(4);
+        for (let i = 0; i < N; i++){
+          const t0 = performance.now();
+          S.t = tf + i/60;
+          if (modeId === 'web') updateNet(1/60, 1.0);
+          renderFrame(S, 1/60);
+          // NOT gl.finish() -- under ANGLE/Metal it returns without waiting for the GPU,
+          // so timing around it measures CPU-side command submission and reports the
+          // same ~0.3ms at 540p and at 2160p (a 16x pixel change). A 1-pixel readPixels
+          // cannot be faked: the CPU needs the actual rendered data, so it blocks until
+          // the GPU has retired the work.
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, benchPx);
+          vctx.drawImage(glCanvas, 0, 0, W, H);
+          drawHUD({bass,mid,treb,energy}, (tf + i/60)*1000);
+          ts.push(performance.now() - t0);
+        }
+        const warm = ts.slice(Math.min(ts.length-1, 10));   // drop shader-compile frames
+        const srt = warm.slice().sort((a,b)=>a-b);
+        const out = { bench: true, mode: modeId, w: W, h: H, n: warm.length,
+                      p50: srt[srt.length>>1], p95: srt[Math.floor(srt.length*0.95)],
+                      min: srt[0], max: srt[srt.length-1] };
+        if (postTo) fetch(postTo + '?bench=1', { method:'POST', body: JSON.stringify(out) })
+          .then(()=>fetch(`${postTo}?done=1`), ()=>fetch(`${postTo}?done=1`));
+        return;
+      }
       let _tframes = 0;
       (function testLoop(){
         if (animN){ S.t = tf + _tframes/60; updateNet(1/60, 1.0); }

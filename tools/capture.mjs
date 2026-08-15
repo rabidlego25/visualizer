@@ -46,7 +46,12 @@ const flag = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] 
 const has = (k) => argv.includes(k);
 const SHOTS = parseInt(flag('--shots', '1'), 10);
 const OUT = flag('--out', 'shot');
-const HEADFUL = !has('--headless');   // real window by default -> real GPU
+// HEADLESS BY DEFAULT. --headless=new with ANGLE/Metal uses the real GPU on Apple
+// silicon -- verified against a headful run on an identical state: coverage agreed to
+// within 0.23 points and mean luma to 0.0002. A visible window is therefore pure cost:
+// it steals focus on every state, which makes a six-state sweep six interruptions to
+// whatever the user is doing. `--headful` if a real window is ever genuinely needed.
+const HEADFUL = has('--headful');
 const queries = argv.filter(a => !a.startsWith('--') && argv[argv.indexOf(a) - 1] !== '--shots'
                             && argv[argv.indexOf(a) - 1] !== '--out' && argv[argv.indexOf(a) - 1] !== '--states');
 
@@ -107,9 +112,14 @@ const args = [
   '--window-size=1100,1200',
 ];
 if (!HEADFUL) args.push('--headless=new', '--use-angle=metal');
+// never leave a browser behind, even on ctrl-c or a crash
+const kids = new Set();
+const reap = () => { for (const c of kids) { try { c.kill('SIGKILL'); } catch {} } kids.clear(); };
+process.on('exit', reap); process.on('SIGINT', () => { reap(); process.exit(130); });
+process.on('uncaughtException', e => { reap(); console.error(e); process.exit(1); });
 
 console.log(`${STATES.length} state(s) x ${SHOTS} shot(s) -> scratchpad/cap/${OUT}/`);
-console.log(HEADFUL ? 'real browser window (real GPU)' : 'headless (--headless)');
+console.log(HEADFUL ? 'HEADFUL: a real window will open and take focus' : 'headless (real GPU via ANGLE/Metal, no window)');
 
 const written = [];
 for (const [label, q] of STATES) {
@@ -124,11 +134,12 @@ for (const [label, q] of STATES) {
   };
   const done = new Promise(r => { onDone = r; });
   const ch = spawn(CHROME, [...args, url], { stdio: 'ignore' });
+  kids.add(ch);
   // unref the guard timer, or node keeps the event loop alive for the full 90s AFTER the
   // frame has already arrived -- a 2s capture was taking 90s of doing nothing.
   const guard = new Promise(r => { const t = setTimeout(r, 90000); t.unref(); });
   await Promise.race([done, guard]);
-  ch.kill();
+  ch.kill(); kids.delete(ch);
   written.push(...got);
   console.log(`  ${label.padEnd(12)} ${got.length} frame(s)  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 }
