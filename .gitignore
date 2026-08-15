@@ -12,3 +12,8 @@ AGENTS.md
 __pycache__/
 *.pyc
 scratchpad_eval/
+
+# local test audio - copyrighted, must not be published with the site
+*.mp3
+*.m4a
+*.flac

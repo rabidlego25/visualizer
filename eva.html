@@ -285,6 +285,7 @@
       // an <audio> element may only ever have ONE MediaElementSource -- create it
       // once and reuse it, or a second load throws InvalidStateError (drop #2 fails).
       mediaElSrc = audioCtx.createMediaElementSource(mediaEl);
+      bindPlayState(mediaEl);
     }
     mediaEl.src = currentURL; mediaEl.loop=false;
     mediaEl.onended = () => { playBtn.textContent='▶ Play'; };
@@ -312,9 +313,29 @@
   }
   function play() {
     if (!mediaEl) return;
-    if (audioCtx.state==='suspended') audioCtx.resume();
-    if (mediaEl.paused) { mediaEl.play(); playBtn.textContent='❚❚ Pause'; }
-    else { mediaEl.pause(); playBtn.textContent='▶ Play'; }
+    // BOTH of these are async and BOTH fail without a user gesture: an AudioContext
+    // cannot resume and mediaEl.play() rejects when autoplay is blocked. The old code
+    // fired them and set the label synchronously, so a blocked autoplay left the button
+    // reading "Pause" while nothing was playing -- the next click was then read as a
+    // PAUSE, and it took several presses to reach a consistent state. Reported from a
+    // real load: "started on pause and had to be pressed 3 times to begin".
+    // Resume first, then play, and only claim to be playing once the promise resolves.
+    if (!mediaEl.paused) { mediaEl.pause(); playBtn.textContent = '▶ Play'; return; }
+    const start = () => {
+      const p = mediaEl.play();
+      if (p && p.then) p.then(() => { playBtn.textContent = '❚❚ Pause'; },
+                              () => { playBtn.textContent = '▶ Play'; });
+      else playBtn.textContent = '❚❚ Pause';
+    };
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().then(start, start);
+    else start();
+  }
+  // Keep the label honest even when something else changes playback state (autoplay
+  // policy, the end of the track, the OS media keys). A button that lies about state is
+  // worse than one that is merely disabled.
+  function bindPlayState(el){
+    el.addEventListener('play',  () => { playBtn.textContent = '❚❚ Pause'; });
+    el.addEventListener('pause', () => { playBtn.textContent = '▶ Play'; });
   }
   function fmt(s){ if(!isFinite(s))return '0:00'; s=Math.floor(s); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; }
 
@@ -700,7 +721,7 @@
   uniform sampler2D u_hist;         // COLS x ROWS spectrum history, row 0 = oldest
   uniform sampler2D u_row;          // 1 x ROWS per-row musical state, same scroll
   uniform float u_rows, u_amp, u_time, u_bass, u_beat, u_burst, u_safe, u_sway;
-  uniform float u_waveAmp, u_waveK, u_wavePh;
+  uniform float u_waveAmp, u_waveK, u_wavePh, u_beatLift;
 
   const float PERSP = 2.6;          // gentler than it was: 3.2 crowded the horizon and
                                     // left ~54px between adjacent rows in the foreground
@@ -708,10 +729,15 @@
 
   // Surface height at any (u, row), pre-perspective. Sampled at neighbours too, so the
   // shading below can build a real normal instead of guessing.
-  float heightAt(float u, float row, float rowE){
+  float heightAt(float u, float row, float rowE, float rowBeat){
     float m  = texture(u_hist, vec2(u, (row+0.5)/u_rows)).r;
     float zz = 1.0 - row/(u_rows-1.0);
-    float h  = m*m*u_amp*(1.0 + u_bass*0.35 + u_burst*0.5*u_safe);
+    // PER-ROW beat lift. The height had no beat term at all -- beats only tinted the
+    // ridge line, so the terrain never moved and the mode read as unrhythmic. Because
+    // rowData captures the beat strength AT THE MOMENT each row was pushed, lifting by
+    // that value makes a beat raise its own ridge and then scroll away to the horizon:
+    // the terrain becomes a visible record of the rhythm rather than a live meter.
+    float h  = m*m*u_amp*(1.0 + u_bass*0.35 + u_burst*0.5*u_safe + rowBeat*u_beatLift);
     // travelling synth wave, phase-locked to the beat grid, with a second harmonic so
     // the crest has a waveform shape rather than a plain sine
     float ph = u*u_waveK - u_time*1.7 + zz*5.0 + u_wavePh*6.2831;
@@ -728,13 +754,19 @@
     float zz  = age;
     float sc  = scaleAt(zz);
 
-    float h  = heightAt(a_v.x, row, rd.b);
+    float h  = heightAt(a_v.x, row, rd.b, rd.r);
     // Normal by finite differences across the spectrum axis AND across depth. This is
     // what makes it read as a lit 3D surface rather than a contour chart.
     float du = 1.6/192.0;
-    float hL = heightAt(a_v.x-du, row, rd.b), hR = heightAt(a_v.x+du, row, rd.b);
-    float hB = heightAt(a_v.x, max(row-1.0, 0.0),        rd.b);
-    float hF = heightAt(a_v.x, min(row+1.0, u_rows-1.0), rd.b);
+    float hL = heightAt(a_v.x-du, row, rd.b, rd.r), hR = heightAt(a_v.x+du, row, rd.b, rd.r);
+    // The depth neighbours sample THEIR OWN row state. Reusing this row's beat here
+    // would cancel the very slope the lift creates, and the raised ridge would come out
+    // unlit -- the punch would be geometric but invisible.
+    float rowB = max(row-1.0, 0.0), rowF = min(row+1.0, u_rows-1.0);
+    vec4 rdB = texture(u_row, vec2(0.5, (rowB+0.5)/u_rows));
+    vec4 rdF = texture(u_row, vec2(0.5, (rowF+0.5)/u_rows));
+    float hB = heightAt(a_v.x, rowB, rdB.b, rdB.r);
+    float hF = heightAt(a_v.x, rowF, rdF.b, rdF.r);
     vec3 n = normalize(vec3(-(hR-hL)*30.0, 1.0, -(hF-hB)*10.0));
     v_shade = clamp(dot(n, normalize(vec3(-0.42, 0.70, 0.58))), 0.0, 1.0);
 
@@ -782,6 +814,13 @@
     // Ridge lines fade harder with depth than the surface does. In the far field rows
     // are ~3px apart, and at full strength they pile into a moire thicket instead of
     // resolving into the surface they sit on.
+    // Depth fade with NO FLOOR. It used to be (0.30 + 0.70*(1-age)), so a ridge line was
+    // still at 30% at the horizon -- and in the far field rows sit ~3px apart, so 112 of
+    // them at 30% is a corduroy of near-Nyquist stripes rather than a surface. The post
+    // chain's chromatic aberration then fringes that pattern in colour, the same way the
+    // CRT scanline used to (see Recording notes). Going to zero lets the far field
+    // RESOLVE INTO the shaded surface, which is what the surface shading exists for;
+    // only the nearest rows carry ridge lines. pow>1 keeps the near field crisp.
     float line = (exp(-v_below*150.0) + 0.35*exp(-v_below*45.0)) * (0.30 + 0.70*(1.0-v_age));
     col += mix(base, vec3(1.0,0.95,0.86), clamp(m*m*1.3, 0.0, 0.7))
          * line * (0.30 + m*1.9 + rEnergy*0.8) * fade;
@@ -1510,6 +1549,18 @@
       const o = modeSel.querySelector('option[value="fluid"]');
       if (o) o.remove();
     }
+    // WATERFALL IS SHELVED (2026-08). Judged live on a real track: "looks awful".
+    // The code is left intact and `?mode=water` still selects it, so the render/capture
+    // harnesses keep working and it can be revived without archaeology -- it is only
+    // removed from the picker so nobody lands on it. Do not delete the mode; the shelving
+    // is a product call, not a claim that the code is wrong.
+    // What was tried before shelving: per-row beat lift (tuned to 2.2 against a real beat
+    // grid) and the mode-aware scanline. Both helped and neither was enough. The verdict
+    // was reached by WATCHING it, after three of my still-frame diagnoses were wrong.
+    if (!new URLSearchParams(location.search).has('water')){
+      const ow = modeSel.querySelector('option[value="water"]');
+      if (ow) ow.remove();
+    }
     // The nebula is built separately and allowed to FAIL: if a device chokes on the
     // particle programs, the web mode still has to come up rather than taking the whole
     // visualizer down with it.
@@ -1602,7 +1653,15 @@
     gl.uniform1f(U(progPost,'u_grain'), recording ? 0.005 : 0.018);
     // ~3.6px per line at 1080p, and shallower on a take -- high-contrast 1px detail is
     // the first thing a codec turns into shimmer, and it eats the bitrate too
-    gl.uniform1f(U(progPost,'u_scan'),  recording ? 0.06 : 0.14);
+    // The scanline is a 6.4px-period luma modulation (u_scanN=300 over a 1920 frame),
+    // which is near Nyquist -- so how visible it is depends entirely on how much BRIGHT,
+    // SMOOTH area the mode puts under it. The web and nebula are sparse and dark and it
+    // reads as texture; the waterfall and fluid fill the frame with large pale surfaces
+    // and the same setting reads as corduroy, fringed in colour by the chromatic
+    // aberration downstream. Measured on a waterfall frame: at 0.14 the 6px component is
+    // 29.5% of the vertical spectrum; at 0.02 it is 4.4%.
+    const fullFrameMode = (modeId === 'water' || modeId === 'fluid');
+    gl.uniform1f(U(progPost,'u_scan'),  recording ? 0.06 : (fullFrameMode ? 0.05 : 0.14));
     gl.uniform1f(U(progPost,'u_scanN'), 300.0);
     drawQuad();
     gl.activeTexture(gl.TEXTURE0);
@@ -2429,6 +2488,10 @@
     freqData.set(base);
   }
   function setRelief(v){ waterAmp = 0.20 + v*0.95; }
+  // Tuned against the real track's beat grid (117 BPM, real per-beat strengths) rather
+  // than a metronome, sweeping 0.4/1.15/2.2/3.5: 0.4 is barely rhythmic, 1.15 is modest,
+  // 3.5 tips into a spike forest where peaks overlap. 2.2 gives crests you can count.
+  let waterBeatLift = 2.2;   // sweepable via ?beatlift= for tuning
 
   // ---------------- Fluid / smoke (CPU driver) ----------------
   let fVel=[null,null], fDye=[null,null], fPrs=[null,null], fDiv=null, fCurl=null;
@@ -2960,6 +3023,7 @@
     // on its own clock. With no tempo lock yet (bpmConf low) it falls back to a free run
     // off u_time, which is what the shader's -u_time term already provides.
     gl.uniform1f(U(progWater,'u_waveAmp'), (0.045 + S.bass*0.075 + S.burst*0.06) * waterAmp);
+    gl.uniform1f(U(progWater,'u_beatLift'), waterBeatLift);   // how hard a beat raises its own row
     gl.uniform1f(U(progWater,'u_waveK'), 7.0 + S.treb*22.0);
     gl.uniform1f(U(progWater,'u_wavePh'), bpmConf > 0.25 ? beatPhase : 0.0);
     gl.uniform1f(U(progWater,'u_amp'), waterAmp);
@@ -3643,6 +3707,7 @@
       if (P.has('trails')) trailsOn = tp('trails',1) > 0.5;
       if (P.has('density')) setDensity(tp('density',0.8));
       if (P.has('relief'))  setRelief(tp('relief',0.6));
+      if (P.has('beatlift')) waterBeatLift = tp('beatlift',1.15);
       const bass=tp('bass',0.1), mid=tp('mid',0.1), treb=tp('treb',0.1), bt=tp('beat',0), tf=tp('t',2.0);
       const energy = bass*0.6 + mid*0.3 + treb*0.1;
       const ex = P.has('expo') ? tp('expo',1) : Math.max(0.5, 1.0/(1.0+energy*1.25));
@@ -3714,15 +3779,94 @@
       // static render, so it needs real frames to accumulate before the screenshot.
       const animN = P.has('anim') ? Math.max(1, tp('anim',45)|0) : 0;
       const frames = animN || 6;
+      // ---- CAPTURE MODE: `&shots=N&post=/__frame` --------------------------------
+      // Grab N frames spread across the animation and POST them to a local harness.
+      // This exists because the headless SwiftShader path costs ~4 MINUTES per frame for
+      // the heavy modes, which turns any tuning question into an hour. The app is already
+      // rendering these states on the real GPU at 60fps; capturing there and posting the
+      // pixels out is the same evidence, ~1000x faster.
+      // N > 1 also gives a FILMSTRIP, which is the only way to judge motion -- "does the
+      // disc sweep coherently", "does the cut read" and "is the beat jerky" are all
+      // temporal questions that a single frame cannot answer.
+      const shotsN = P.has('shots') ? Math.max(1, tp('shots',1)|0) : 0;
+      const postTo = P.get('post');
+      const shotAt = new Set();
+      if (shotsN) for (let i=0;i<shotsN;i++) shotAt.add(Math.max(0, Math.round((i+1)*frames/shotsN) - 1));
+      const pending = [];
+      function grabFrame(i){
+        if (!postTo) return;
+        // toBlob is async and must finish BEFORE the harness is told the run is done,
+        // or the last frames race the shutdown and arrive truncated or not at all.
+        pending.push(new Promise(done => {
+          view.toBlob(bl => {
+            if (!bl) return done();
+            fetch(`${postTo}?i=${String(i).padStart(3,'0')}`, { method:'POST', body: bl })
+              .then(done, done);
+          }, 'image/png');
+        }));
+      }
+      // `&vary=N` modulates the spectrum per frame during an anim run.
+      // Without it the waterfall cannot be judged AT ALL: its terrain IS its history, and
+      // a held spectrum pushes the same row forever, so every row converges and the
+      // terrain degenerates into a smooth extrusion of one shape within ~1.5s. That looks
+      // like a rendering bug and is purely an artefact of the harness holding the FFT
+      // still. Off by default so existing render_eval states stay byte-comparable.
+      const varyAmt = P.has('vary') ? tp('vary', 1) : 0;
+      const baseFFT = varyAmt ? Uint8Array.from(freqData) : null;
+      // `&beatsrc=<url>` drives the beat from a REAL track's analysed grid instead of a
+      // synthetic pulse, so rhythm-reactive constants can be tuned against actual music
+      // (uneven strengths, real tempo, fills and gaps) rather than a metronome. `t=` is
+      // the song time the window starts at. Deterministic, so A/B sweeps are comparable.
+      let beatSched = null, beatIdx = 0, driveBeat = 0;
+      if (P.has('beatsrc')){
+        const rq = new XMLHttpRequest();      // sync: the render loop starts immediately below
+        rq.open('GET', P.get('beatsrc'), false); rq.send(null);
+        try { beatSched = JSON.parse(rq.responseText).beats; } catch(e){ beatSched = null; }
+      }
       let _tframes = 0;
       (function testLoop(){
         if (animN){ S.t = tf + _tframes/60; updateNet(1/60, 1.0); }
+        if (beatSched){
+          // same shaping analyze() applies: an impulse scaled by strength, then decay,
+          // so the tuned constant means the same thing live as it does here.
+          const songT = tf + _tframes/60;
+          while (beatIdx < beatSched.length && beatSched[beatIdx][0] <= songT){
+            driveBeat = Math.max(driveBeat, 0.4 + beatSched[beatIdx][1]*0.85);
+            beatIdx++;
+          }
+          S.beat = driveBeat;
+          driveBeat *= 0.88;
+        }
+        if (varyAmt){
+          // slow independent drifts per band, so the history gets real structure rather
+          // than one shape scrolled -- three incommensurate rates avoid a visible cycle
+          const u = _tframes/60;
+          // Pulse the beat too, or rhythmic features cannot be evaluated at all: a held
+          // beat value lifts every history row equally, which is indistinguishable from
+          // no beat response. 120 BPM.
+          if (!beatSched){
+            const bp2 = (u*2) % 1;
+            S.beat = bt + (1 - bt) * Math.pow(1 - bp2, 6) * varyAmt;
+          }
+          for (let i=0;i<baseFFT.length;i++){
+            const m = 1
+              + Math.sin(u*2.1 + i*0.031)*0.30*varyAmt
+              + Math.sin(u*3.7 - i*0.013)*0.22*varyAmt
+              + Math.sin(u*0.9 + i*0.007)*0.18*varyAmt;
+            freqData[i] = Math.max(0, Math.min(255, baseFFT[i]*m));
+          }
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, fftTex);
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
+        }
         renderFrame(S, 1/60);
         vctx.drawImage(glCanvas, 0, 0, W, H);
         drawHUD({bass,mid,treb,energy}, (tf + _tframes/60)*1000);
+        if (shotAt.has(_tframes)) grabFrame(shotAt.size === 1 ? 0 : _tframes);
         // render a few frames then STOP so headless virtual-time can idle
         // (the frame is deterministic, so this settles immediately) and screenshot.
         if (++_tframes < frames) requestAnimationFrame(testLoop);
+        else if (postTo) Promise.all(pending).then(() => fetch(`${postTo}?done=1`));
       })();
       return; // skip the normal idle preview
     }

@@ -72,6 +72,10 @@ function toSchema(name, A) {
     tempo_bpm: A.tempo ? A.tempo.bpm : null,
     tempo_confidence: A.tempo ? A.tempo.confidence : null,
     beats: A.beats || [],
+    // carried because per-beat dynamics are what distinguish a real performance from a
+    // metronome -- anything tuning a beat-reactive constant needs them, and dropping
+    // them silently makes every beat identical.
+    beatStrength: A.beatStrength || [],
     downbeats: A.downbeats || [],
     boundaries: bounds,
     key: A.key ? { tonic: A.key.tonic, mode: A.key.mode, confidence: A.key.confidence } : null,
