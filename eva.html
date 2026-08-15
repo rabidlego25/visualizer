@@ -2414,6 +2414,9 @@
   let wBinLo = null, wBinHi = null;      // per-column FFT bin span (log-spaced)
   let wAcc = 0, waterAmp = 0.96;      // matches the slider's 0.8 default via setRelief
   let fluidGain = 1.35;               // "Billow": how much dye the emitters push
+  let fWideOv = 0;                    // ?fwide= override for tuning sweeps; 0 = auto
+  let fBeatEnv = 0;                   // slow envelope of beat activity (see simFluid)
+  let fWidth = 1.0;                   // eased base-emitter width, 1.0 fed .. 6.0 starved
 
   // Columns are spaced by a power curve, not linearly: a linear frequency axis spends
   // most of the frame on 10-20 kHz, where music has almost nothing, and crushes the
@@ -2587,13 +2590,49 @@
       // pulsing field and a steady one are indistinguishable). Feed above ~0.6
       // starts pulsing again, so this is not a 'more is better' knob.
       const amp = (1.05 + S.bass*0.95 + S.coil*0.55) * fluidGain;
+      // SPREAD, at constant total feed. A 2D gaussian's integral scales with u_radius,
+      // so widening by fWide and dividing the amplitude by it changes the SHAPE of the
+      // source without changing how much dye enters -- which is the point, because
+      // strength is the knob already at its ceiling (feed above ~0.6 pulses) and the
+      // measured symptom was never level, it was WIDTH: the base emitter is ~0.06uv
+      // half-width and sways over x 0.33..0.67, so with no beats to throw dye off-axis
+      // the whole field is a column in the middle third (26% coverage, 50% of columns
+      // lit). Beats hid this -- they fire bursts at radius 0.30 and take a groove state
+      // to 90% coverage, so every state that looked healthy was being filled by the
+      // beats, not by the emitter that exists to keep QUIET passages alive.
+      // ...and the spread is FED BACK from how starved the field is, not fixed. Beats
+      // throw dye off-axis at radius 0.30 and the coil term above already feeds the
+      // emitter, so in those states a wide source buys no coverage and costs stability:
+      // measured over 7 marks at a flat width 6, QUIET went 33->63% coverage AND got
+      // steadier (spread 12.8->9.5), but COILED hit spread 35.7 (a frame visibly
+      // pulsing 38%..74%) and groove fell 90->81%. Same discipline as the coil feed:
+      // it must be ~zero on the states that were already right.
+      // `fBeatEnv` decays ~0.995/frame (half-life ~2.3s), so it reads "are there beats
+      // at all" rather than "is one happening now" -- S.beat is an impulse and would
+      // reopen the emitter between every hit.
+      // It is a THRESHOLD between two measured widths, not a ramp, because width is not
+      // a monotone knob: on COILED, spread by width runs 1 -> 8.5, 1.95 -> 27.9,
+      // 4 -> 14.0, 6 -> 35.7, and on groove coverage runs 1 -> 89.6, 2 -> 72.9,
+      // 4 -> 74.8, 6 -> 81.5. There is a resonance in the middle, so ANY continuous ramp
+      // parks half-fed states in the unstable band -- both a linear and a ^4 ramp were
+      // measured doing exactly that. Snapping between 1.0 and 6.0 means every state
+      // lands on a configuration that has been rendered and measured explicitly.
+      // `fBeatEnv` decays ~0.995 per emitter fire (half-life ~2.3s), so it reads "are
+      // there beats at all" rather than "is one happening now" -- S.beat is an impulse
+      // and would reopen the emitter between every hit.
+      fBeatEnv = Math.max(fBeatEnv*0.995, S.beat);
+      const starved = Math.max(0, Math.min(1, 1 - fBeatEnv*1.6 - S.coil*0.9));
+      // eased so the switch is not a visible pop; it crosses the unstable middle only in
+      // transit (seconds, at the edge of a breakdown) instead of sitting there.
+      fWidth += ((starved > 0.75 ? 6.0 : 1.0) - fWidth) * 0.04;
+      const rW = fWideOv || fWidth, aW = amp / rW;
       // The vertical kick is now a SEED, not a jet (was 260*amp). Buoyancy lifts the
       // column from the dye itself, which is what gives it billow; firing it upward as
       // well just returns to the uniform updraft that emptied the frame.
-      fV = fSplat(fVel, fV, p, 0.06, (Math.sin(fluidT*0.9))*90, 70*amp, 0, 0.0009);
+      fV = fSplat(fVel, fV, p, 0.06, (Math.sin(fluidT*0.9))*90, 70*aW, 0, 0.0009*rW);
       // the standing column drifts slowly through the walk; hits jump it
-      const ink = fInk(S.c1, 0.35, amp*0.55);
-      fD = fSplat(fDye, fD, p, 0.06, ink[0], ink[1], ink[2], 0.0011);
+      const ink = fInk(S.c1, 0.35, aW*0.55);
+      fD = fSplat(fDye, fD, p, 0.06, ink[0], ink[1], ink[2], 0.0011*rW);
     }
     // beats fire off-axis bursts; the drop detonates the middle
     if (S.beat > 0.35){
@@ -3708,6 +3747,7 @@
       if (P.has('density')) setDensity(tp('density',0.8));
       if (P.has('relief'))  setRelief(tp('relief',0.6));
       if (P.has('beatlift')) waterBeatLift = tp('beatlift',1.15);
+      if (P.has('fwide'))    fWideOv = tp('fwide',0);
       const bass=tp('bass',0.1), mid=tp('mid',0.1), treb=tp('treb',0.1), bt=tp('beat',0), tf=tp('t',2.0);
       const energy = bass*0.6 + mid*0.3 + treb*0.1;
       const ex = P.has('expo') ? tp('expo',1) : Math.max(0.5, 1.0/(1.0+energy*1.25));
