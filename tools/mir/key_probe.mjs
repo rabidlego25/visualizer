@@ -92,25 +92,16 @@ console.log('\nB. end to end, with four-on-the-floor drums (is the CHROMA right?
 const RELATIVE = { 'C major': 'A minor', 'A minor': 'C major' };
 for (const [label, prog, want, strict, xfail] of [
   ['C-C-F-C',      [C, C, F, C],     'C major', true],
-  // XFAIL: comes back G major, a FIFTH out. The stimulus is not at fault -- its ideal
-  // chroma scores C major at 0.959. The C chord is voiced C4/E4/G4 = 262/330/392 Hz, so
-  // two of its three tones sit below ~360 Hz where a semitone is narrower than one FFT
-  // bin, while the G chord (392/494/587) is entirely above it. The low chord is simply
-  // measured worse than the high one, so the high one wins. Fixing it properly wants a
-  // constant-Q transform (or a longer FFT for the low register), which is an
-  // architectural change to the 2048-point STFT, not a constant to tune. Do NOT try to
-  // patch it by down-weighting the low register: that was tried, and it regressed two
-  // cases that were passing, because the low register is where the tonic often lives.
-  ['C-F-G-C',      [C, F, G, C],     'C major', true, true],
+  // Was XFAIL (came back G major, a fifth out). Fixed by keyChroma: a long-window STFT
+  // for the key alone, plus third-harmonic deweighting. Kept because it is the sharpest
+  // fifth-error case in the set -- the C and G pitch classes are TIED in the ideal
+  // chroma, so anything that biases toward the fifth shows up here first.
+  ['C-F-G-C',      [C, F, G, C],     'C major', true],
   ['Am-Dm-Am-Am',  [Am, Dm, Am, Am], 'A minor', true],
-  // KNOWN LIMITATION, asserted loosely on purpose. Relative major/minor share all seven
-  // pitch classes -- only the emphasis differs -- so it is the classic hard case for any
-  // profile-based detector, and this one lands on C major here. It is not the same class
-  // of error as the F-major result that motivated this work: a relative confusion scores
-  // 0.3 on the MIREX weighting and keeps the palette in a sane place, where a fifth error
-  // does not. Tightening it needs tonic emphasis (downbeat/phrase-end weighting), which
-  // is a real piece of work and not worth faking with a threshold.
-  ['Am-Am-F-G',    [Am, Am, F, G],   'A minor', false],
+  // Relative major/minor share all seven pitch classes -- only emphasis separates them --
+  // so this is the classic hard case for any profile-based detector. It used to come back
+  // C major (the relative) and is now correct; asserted strictly so it stays that way.
+  ['Am-Am-F-G',    [Am, Am, F, G],   'A minor', true],
 ]) {
   const A = analyzeSong(synth(prog));
   const got = A.ok && A.key ? `${A.key.tonic} ${A.key.mode}` : 'FAILED';

@@ -584,6 +584,92 @@
              mode: best.mode, confidence: clamp(best.score, 0, 1) };
   }
 
+  // ---- key chroma: a LONGER window, because 2048 cannot resolve the low register --
+  // At FFT_N=2048 the bin spacing is 21.5Hz while a semitone at C4 (262Hz) is 15.6Hz --
+  // narrower than one bin, so C4 and C#4 land in the same place and any pitch class
+  // assigned down there is close to a guess. That is not a weighting problem and no
+  // weighting fixes it: down-weighting the low register was tried and made things worse,
+  // because the low register is frequently where the tonic lives. The information has to
+  // be measured, which means a longer window.
+  //
+  // 8192 gives 2.2 bins per semitone at 200Hz and 2.9 at C4. The 186ms window smears
+  // time badly, which is exactly why this is NOT used for beats, downbeats or sections --
+  // only for the one global question ("what key is this song in") where time resolution
+  // is irrelevant and frequency resolution is everything.
+  //
+  // Strided 4x: at ~21 frames/sec this still samples every chord many times over, and it
+  // keeps the extra pass to roughly a third of the main spectrogram's cost.
+  function keyChroma(L, R, sr, stereo, harm, perc, F, prog){
+    const N = 8192, STRIDE = 4;
+    if (L.length < N) return null;
+    const fft = new FFT(N);
+    const win = new Float64Array(N);
+    for (let i=0;i<N;i++) win[i] = 0.5 - 0.5*Math.cos(2*Math.PI*i/N);
+    const half = N>>1;
+    const bLo = Math.max(1, Math.round(200*N/sr));
+    const bHi = Math.min(half-1, Math.round(2100*N/sr));
+    // pitch class + semitone-centre weight, same shape as the main chroma
+    const pc = new Int8Array(half).fill(-1), pw = new Float32Array(half);
+    for (let b=bLo;b<bHi;b++){
+      const f = b*sr/N;
+      const midi = 69 + 12*Math.log2(f/440);
+      pc[b] = ((Math.round(midi) % 12) + 12) % 12;
+      pw[b] = Math.exp(-0.5*Math.pow((midi - Math.round(midi))/0.28, 2));
+    }
+    const re = new Float64Array(N), im = new Float64Array(N);
+    const mag = new Float64Array(half), cum = new Float64Array(half+1);
+    const out = new Float32Array(12);
+    // guard band: the floor is the mean of a neighbourhood that EXCLUDES the bins a
+    // partial itself occupies, or a strong peak inflates its own floor and erases itself.
+    const GUARD = 8, SPAN = 40;
+    // 3rd-harmonic credit. Swept 0.00-0.60 against the key_probe progressions: every
+    // value from 0.15 up passes all four, only 0.00 (no correction) fails. A wide
+    // plateau, so this is not a fitted constant.
+    const H3 = 0.33;
+    for (let f=0; f<F; f+=STRIDE){
+      const base = f*HOP - half;
+      for (let i=0;i<N;i++){
+        const t = base + i;
+        const l = (t >= 0 && t < L.length) ? L[t] : 0;
+        const r = stereo ? ((t >= 0 && t < R.length) ? R[t] : 0) : l;
+        re[i] = (l+r)*0.5*win[i]; im[i] = 0;
+      }
+      fft.forward(re, im);
+      for (let b=0;b<half;b++) mag[b] = Math.sqrt(re[b]*re[b] + im[b]*im[b]);
+      cum[0] = 0;
+      for (let b=0;b<half;b++) cum[b+1] = cum[b] + mag[b];
+      // a frame that is mostly drums should barely vote at all
+      const hr = harm[f] + perc[f] > 1e-9 ? harm[f]/(harm[f] + perc[f]) : 0.5;
+      const w = Math.max(0, hr - 0.3)/0.7;
+      if (w <= 0) continue;
+      for (let b=bLo;b<bHi;b++){
+        const p = pc[b];
+        if (p < 0) continue;
+        const loA = Math.max(0, b-SPAN), loB = Math.max(0, b-GUARD);
+        const hiA = Math.min(half, b+GUARD+1), hiB = Math.min(half, b+SPAN+1);
+        const n = (loB-loA) + (hiB-hiA);
+        if (n <= 0) continue;
+        const floor = ((cum[loB]-cum[loA]) + (cum[hiB]-cum[hiA]))/n;
+        const tonal = mag[b] - floor;
+        if (tonal > 0){
+          const e = Math.log(1 + tonal)*pw[b]*w;
+          out[p] += e;
+          // THIRD-HARMONIC DEWEIGHTING. The 3rd harmonic of a note is its fifth an
+          // octave up, so every C in the mix also deposits energy on G. On a C-F-G-C
+          // progression G therefore collects votes from the C chords (their fifths AND
+          // their 3rd harmonics) on top of its own, and beats C 1.00 to 0.77 even though
+          // the ideal chroma has them tied -- a textbook fifth error that no amount of
+          // frequency resolution fixes, because the energy really is there.
+          // Crediting part of each bin back to the fundamental it could be the 3rd
+          // harmonic of (7 semitones down, i.e. +5 mod 12) is what a proper HPCP does.
+          out[(p+5)%12] += e*H3;
+        }
+      }
+      if (prog && (f & 1023) === 0) prog('key', f/F);
+    }
+    return out;
+  }
+
   // ---- main -----------------------------------------------------------------
   function analyzeSong(o){
     const t0 = Date.now();
@@ -675,7 +761,10 @@
       });
       let ck = new Float32Array(12);
       for (let i=0;i<bf.nB;i++) for (let p=0;p<12;p++) ck[p] += bf.ch[i][p];
-      key = keyOf(ck);
+      // Prefer the long-window chroma for the KEY only. Everything else (downbeats,
+      // sections) keeps the 2048 chroma, where time resolution actually matters.
+      const ckHi = keyChroma(L, R, sr, stereo, hp.harm, hp.perc, F, prog);
+      key = keyOf(ckHi || ck);
     }
 
     // vocal proxy: centre-panned energy, gated on the frame being harmonic. Vocals are

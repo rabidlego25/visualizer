@@ -31,7 +31,7 @@ not masquerade as a catastrophic `analysis.js` failure.
 ## Running it
 
 ```bash
-# 1. ours (fast, ~47x realtime, CPU)
+# 1. ours (fast, ~40x realtime, CPU)
 node tools/mir/extract_ours.mjs --in ~/tracks --out out/ours
 
 # 2. reference (GPU)
@@ -82,6 +82,14 @@ discriminate. `downbeat_probe.mjs` covers it: 6/6, four of them four-on-the-floo
 so broadband hits deposited energy in all twelve pitch classes; a C major track read as
 F minor. Chroma now comes from the harmonic component with the local spectral floor
 subtracted. `key_exact` went 0.667 → 1.000 on the smoke test.
+
+**3. Fifth errors, from two independent causes.** Chasing the leftover `C-F-G-C` → G major
+case turned up both: (a) at FFT 2048 a semitone at C4 is narrower than one bin, so the low
+register is unmeasurable — the key now gets its own 8192-point pass (`keyChroma`); and
+(b) the third harmonic of a note *is* its fifth, so every C deposits energy on G. Crediting
+part of each bin back to the fundamental it could be a 3rd harmonic of fixed it. That also
+resolved the relative major/minor confusion as a side effect, and lifted `test_analysis`'s
+key confidence from 0.52 to 0.93. `key_probe.mjs` is 10/10 with no XFAILs.
 
 Both fixes are in `analysis.js`; the diagnosis notes are in CLAUDE.md.
 
