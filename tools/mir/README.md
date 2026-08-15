@@ -8,13 +8,18 @@ what was intended. It says nothing about whether it is right on a real mix, and
 `eva.html`'s director now hangs the entire scene off those outputs. This harness closes
 that gap.
 
-## The three parts
+## The parts
 
 | file | runs where | what it does |
 |---|---|---|
 | `extract_ours.mjs` | anywhere (node + ffmpeg) | runs the **shipped** `analysis.js` over audio → JSON |
 | `run_reference.py` | the GPU box | runs beat_this / madmom / allin1 / essentia → JSON |
 | `score.py` | anywhere (numpy) | compares the two, or ours vs dataset annotations |
+| `downbeat_probe.mjs` | anywhere | 6 arrangements, one variable each — where does the bar line go wrong? |
+| `key_probe.mjs` | anywhere | classifier-vs-chroma split, and key detection with drums |
+
+The two probes are regression tests for bugs this harness found. Run them after any
+change to `analysis.js`.
 
 `score.py` and its metrics are covered by `test_score.py` (30/30). `extract_ours.mjs`
 was verified end-to-end on synthesised audio. **`run_reference.py` is the one file that
@@ -61,30 +66,43 @@ a relative major/minor. `analysis.js` has already shipped a bug that put the key
 out (bass bins below ~200 Hz voting for an essentially arbitrary pitch class), so the
 weighted score moving while exact accuracy does not points straight at that class of bug.
 
+## Bugs this harness has already found
+
+Both were live, both were invisible to `test_analysis.mjs`, and both hit the common case.
+
+**1. The bar line was one beat late on every four-on-the-floor track.** `findDownbeats`
+weighted low-end energy (the kick) and harmonic change with *fixed* weights. With a kick
+on every beat the low-end means are flat to ~2% across phases, and the snare on 2 and 4
+leaks into the sub-200 Hz band — so that 2% decided it. Beat F stayed 0.990 throughout;
+only the bar phase was wrong, which propagates intact into `beatCount`, the HUD bar pips
+and bar-locked loop recording. Cues are now weighted by how much they actually
+discriminate. `downbeat_probe.mjs` covers it: 6/6, four of them four-on-the-floor.
+
+**2. The key detector was reading drums.** Chroma was built from the mixed spectrogram,
+so broadband hits deposited energy in all twelve pitch classes; a C major track read as
+F minor. Chroma now comes from the harmonic component with the local spectral floor
+subtracted. `key_exact` went 0.667 → 1.000 on the smoke test.
+
+Both fixes are in `analysis.js`; the diagnosis notes are in CLAUDE.md.
+
 ## Known result from the smoke test
 
-On three synthesised tracks with known answers (`extract_ours.mjs` → `score.py`):
+On three synthesised tracks with known answers (`extract_ours.mjs` → `score.py`).
+When first run it reported `downbeat_f 0.000`, `boundary_f@0.5 0.533` and
+`key_exact 0.667`; both underlying bugs were confirmed real and fixed (see above), and
+it now reads:
 
 ```
 beat_f          0.990        tempo_acc1     1.000     tempo err 0.06%
-downbeat_f      0.000        <- all 3 shifted by exactly +1 beat
-boundary_f@0.5  0.533        boundary_f@3.0 0.800
-key_score       0.667        2 of 3 exact (C major read as F minor)
+downbeat_f      1.000        boundary_f@0.5 1.000     boundary_f@3.0 1.000
+key_score       1.000        key_exact      1.000
 ```
 
-Beat tracking and tempo are excellent. **Two candidate issues to confirm on real audio:**
-
-1. **Downbeat phase is one beat late** on a four-on-the-floor stimulus with a backbeat
-   snare. If that reproduces on real tracks it is a live bug — it shifts `beatCount`, the
-   HUD bar pips and bar-locked loop recording together.
-2. **C major read as F minor** (the subdominant, mode flipped). One track is not
-   evidence; a key confusion matrix over a real corpus is.
-
-Both are *candidates*. The stimulus is synthetic and deliberately simple, and simple
-stimuli are exactly where downbeat cues are weakest. Confirm on real music before
-changing anything — and note that the first version of this very smoke test was itself
-wrong (it put C at MIDI 57, which is A, so every "key error" was the test's fault). Check
-the stimulus before believing the finding.
+Note how the first version of this smoke test was itself wrong: it put C at MIDI 57,
+which is A, so every "key error" was the test's fault. **Check the stimulus before
+believing the finding** — twice more in the same session a "bug" turned out to be a
+degenerate stimulus (a tempo probe where 187 BPM is legitimately 3/2 of 120, and a key
+probe using pure sines that all sat below 360 Hz).
 
 ## Schema
 

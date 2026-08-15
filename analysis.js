@@ -223,7 +223,7 @@
       eLow[f] = lo; eMid[f] = mid; eHigh[f] = hi; centre[f] = cen;
       if (prog && (f & 255) === 0) prog('spectrogram', f/F);
     }
-    return { S, F, KEEP, chroma, rms, eLow, eMid, eHigh, centre, binHz: sr/FFT_N };
+    return { S, F, KEEP, chroma, rms, eLow, eMid, eHigh, centre, binHz: sr/FFT_N, pc, pw };
   }
 
   // ---- pass 2: HPSS ---------------------------------------------------------
@@ -231,7 +231,7 @@
   // drum hit is a vertical ridge (broadband, brief). Median-filtering along each axis
   // isolates one and suppresses the other. Only the ENVELOPES survive this pass — the
   // separated spectrograms would be another two 30MB arrays for no downstream use.
-  function hpss(S, F, KEEP, prog){
+  function hpss(S, F, KEEP, prog, pc, pw){
     const H = new Float32Array(F*KEEP);          // time-median (harmonic estimate)
     const col = new Float32Array(F), win = new Float32Array(Math.max(MED_T, MED_F));
     const halfT = MED_T>>1;
@@ -245,6 +245,15 @@
     }
 
     const harm = new Float32Array(F), perc = new Float32Array(F), pflux = new Float32Array(F);
+    // Chroma built from the HARMONIC part, not the mix. Drums are broadband, so every
+    // hit deposits energy in all twelve pitch classes at once; on a track with a kick
+    // on every beat that noise floor buried the actual harmony. Measured on a C major
+    // stimulus whose ideal chroma is C/E/G/F/A and nothing else, the mixed chroma came
+    // back C#=0.69 F#=0.71 G#=0.65 A#=0.56 -- pitch classes that are not played at all
+    // -- and the key read F minor. keyOf itself was fine: fed the ideal chroma it
+    // returns C major at 0.936. The separation already computes a per-bin Wiener mask
+    // here and used to throw it away, so this costs one multiply per bin and no memory.
+    const chromaH = pc ? new Float32Array(F*12) : null;
     const P = new Float32Array(KEEP), prevLog = new Float32Array(KEEP);
     const halfF = MED_F>>1;
     for (let f=0;f<F;f++){
@@ -260,6 +269,19 @@
         const mh = d > 1e-18 ? h*h/d : 0.5;      // soft (Wiener) mask, power 2
         const m = S[off+b];
         hs += m*mh;
+        if (chromaH){
+          const p = pc[b];
+          // The harmonic mask alone is not enough: hats on every eighth are REGULAR, so
+          // the time-median reads them as steady and passes them through as "harmonic".
+          // Subtract the local spectral floor as well -- P[b] is the frequency-median,
+          // already computed just above. A sine stands far above its frequency
+          // neighbours; broadband noise sits at the same level as them, so this keeps
+          // partials and rejects anything flat across the spectrum.
+          const tonal = m - P[b];
+          // same log compression as the mixed chroma: one loud sustained note must not
+          // outvote a whole chord.
+          if (p >= 0 && tonal > 0) chromaH[f*12+p] += Math.log(1 + tonal*mh)*pw[b];
+        }
         const pv = m*(1-mh);
         ps += pv;
         // flux on the log-compressed percussive part: a hit is energy ARRIVING, and the
@@ -272,7 +294,7 @@
       harm[f] = hs; perc[f] = ps; pflux[f] = fx;
       if (prog && (f & 511) === 0) prog('separation', 0.7 + f/F*0.3);
     }
-    return { harm, perc, pflux };
+    return { harm, perc, pflux, chromaH };
   }
 
   // ---- pass 3: tempo + beats ------------------------------------------------
@@ -577,7 +599,10 @@
     const { S, F, KEEP } = sp;
     if (F < 64) return { version:1, ok:false, reason:'too short to analyse', duration };
 
-    const hp = hpss(S, F, KEEP, prog);
+    const hp = hpss(S, F, KEEP, prog, sp.pc, sp.pw);
+    // Every chroma consumer -- downbeat harmonic change, bar features, key -- wants the
+    // harmonic version. The mixed one stays available but nothing should prefer it.
+    const chroma = hp.chromaH || sp.chroma;
     if (prog) prog('tempo', 0);
 
     const onset = onsetEnvelope(hp.pflux, fps);
@@ -586,7 +611,7 @@
     const beats = beatFrames.map(f => f/fps);
     const beatStrength = beatFrames.map(f => clamp(onset[clamp(f,0,F-1)]/3, 0, 1));
 
-    const db = findDownbeats(beatFrames, sp.eLow, sp.chroma, F, [4,3]);
+    const db = findDownbeats(beatFrames, sp.eLow, chroma, F, [4,3]);
     const meter = db.meter;
     const downbeats = [], barFrames = [];
     for (let i=db.phase;i<beatFrames.length;i+=meter){ downbeats.push(beats[i]); barFrames.push(beatFrames[i]); }
@@ -596,7 +621,7 @@
     let sections = [], events = [], arc = [], key = { tonic:'?', mode:'', confidence:0 };
     let bf = null;
     if (barFrames.length > 4){
-      bf = barFeatures(barFrames, sp.chroma, S, F, KEEP, hp.harm, hp.perc, sp.rms, sp.binHz);
+      bf = barFeatures(barFrames, chroma, S, F, KEEP, hp.harm, hp.perc, sp.rms, sp.binHz);
       const L8 = clamp(Math.round(8), 4, Math.max(4, Math.floor(bf.nB/4)));
       const nov = noveltyCurve(bf.ch, bf.tb, bf.nB, L8);
       const bounds = pickBoundaries(nov, bf.en, bf.nB, 4);
