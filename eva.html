@@ -1394,18 +1394,77 @@
   // adaptive resolution: the internal render size tracks the measured frame time so a
   // phone degrades gracefully instead of dropping to a slideshow. The HUD and the
   // recorded canvas stay at full size -- only the shaded pixels shrink.
-  let renderScale = 1, frameMs = 16.7, scaleFrames = 0;
+  let renderScale = 1, frameMs = 16.7, scaleFrames = 0, vsyncObs = 0;
+  // ---- perf probe -----------------------------------------------------------------
+  // `?perf=<url>` POSTs frame-time and renderScale samples so the real machine can be
+  // measured instead of guessed at. There was NO readout of either before this, which is
+  // how a session can spend an hour rendering at half resolution with nothing to show it.
+  const perfURL = new URLSearchParams(location.search).get('perf');
+  // `?fps=1` shows fps + the current render scale. It is a DOM overlay, NOT drawn on the
+  // view canvas, so it can never burn into a take -- the same reason the safe-area guides
+  // are gated on !recording. Without this there is no way to tell that the scaler has
+  // quietly dropped the render to 50%, which looks like "the app got worse" and is
+  // indistinguishable from a rendering bug.
+  const fpsOn = new URLSearchParams(location.search).get('fps') === '1';
+  let fpsEl = null;
+  if (fpsOn){
+    fpsEl = document.createElement('div');
+    fpsEl.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:99;padding:4px 7px;'
+      + 'background:rgba(8,6,12,.82);color:#ffb45a;font:11px ui-monospace,monospace;'
+      + 'border:1px solid #3a2b1c;border-radius:4px;pointer-events:none;letter-spacing:.05em';
+    document.body.appendChild(fpsEl);
+  }
+  let perfBuf = [], perfLast = 0, fpsFrames = 0;
+  function perfTick(dtMs){
+    if (fpsEl && (++fpsFrames % 15) === 0){
+      const pct = Math.round(renderScale*100);
+      fpsEl.textContent = `${(1000/Math.max(frameMs,0.01)).toFixed(0)} fps  ${frameMs.toFixed(1)}ms  `
+        + `scale ${pct}%  ${Math.round(W*renderScale)}x${Math.round(H*renderScale)}`;
+      fpsEl.style.color = pct < 100 ? '#e2231a' : '#ffb45a';
+    }
+    if (!perfURL) return;
+    perfBuf.push([Math.round(dtMs*100)/100, renderScale]);
+    const now = performance.now();
+    if (!perfLast) perfLast = now;
+    if (now - perfLast < 1000) return;
+    perfLast = now;
+    const s = perfBuf.slice(); perfBuf = [];
+    fetch(perfURL, { method:'POST', body: JSON.stringify({
+      mode: modeId, w: W, h: H, scale: renderScale, frameMs: frameMs, samples: s }) });
+  }
+
   function adaptResolution(dt){
     frameMs = frameMs*0.9 + Math.min(dt, 100)*0.1;
     // NEVER downscale while recording. Capturing at 60fps drives frame times up, which
     // would make the scaler shrink the render and hand the encoder an upscaled, soft
     // image -- the export would look worse than the live view for no reason.
+    // Thresholds are RELATIVE TO THE DISPLAY, not absolute. They used to be 21.5ms down
+    // and 17.0ms up, which silently assumed a 60Hz panel: the best frame a 60Hz display
+    // can deliver is 16.67ms, so recovery needed a near jitter-free 60fps while the down
+    // step was twice the size of the up step -- a one-way ratchet. One transient (a drag,
+    // another app taking the GPU) dropped the scale and it never climbed back until a
+    // reload. Worse, on anything reporting 30fps the down test is ALWAYS true and the up
+    // test NEVER is, so it grinds to the 0.50 floor chasing a rate the display cannot
+    // deliver. That is reachable: measured here, a page rendering NOTHING also sits at
+    // 33.3ms, so the cap need not have anything to do with our workload.
+    const obs = Math.min(dt, 100);
+    if (obs > 4) vsyncObs = vsyncObs ? Math.min(vsyncObs, obs) : obs;
+    // Snap the observed floor to a real refresh period: one anomalously fast frame must
+    // not pin it, and a consistently slow SCENE must not be mistaken for a slow DISPLAY.
+    let vs = 16.67;
+    if (vsyncObs){
+      let best = 1e9;
+      for (const h of [6.94, 8.33, 11.11, 16.67, 33.34]){   // 144 120 90 60 30 Hz
+        const e = Math.abs(vsyncObs - h);
+        if (e < best){ best = e; vs = h; }
+      }
+    }
     if (recording) return;
     if (++scaleFrames < 45) return;
     scaleFrames = 0;
     const before = renderScale;
-    if (frameMs > 21.5)      renderScale = Math.max(0.50, renderScale - 0.10);
-    else if (frameMs < 17.0) renderScale = Math.min(1.00, renderScale + 0.05);
+    if (frameMs > vs*1.30)      renderScale = Math.max(0.50, renderScale - 0.10);
+    else if (frameMs < vs*1.08) renderScale = Math.min(1.00, renderScale + 0.05);
     if (Math.abs(renderScale - before) > 1e-3) allocRTs(Math.round(W*renderScale), Math.round(H*renderScale));
   }
 
@@ -3371,6 +3430,7 @@
     lastFrameT = now;
     const dt = dtMs/1000;
     adaptResolution(dtMs);
+    perfTick(dtMs);
     analyser.getByteFrequencyData(freqData);
     analyser.getByteTimeDomainData(timeData);
     const a = analyze(now, dt);
@@ -3737,6 +3797,12 @@
         .then(b => loadFile(new File([b], 'e2e.wav', { type: 'audio/wav' })))
         .catch(e => { window.__e2eErr = String(e && e.message || e); director.failed = true; });
     }
+    // `?res=` outside the test hook too, so the LIVE path can be measured at different
+    // output sizes -- separating "fill-rate bound" from "fixed per-frame overhead" is the
+    // whole diagnosis when the frame rate is pinned.
+    if (P.has('res') && !P.has('test')){
+      baseRes = Math.max(180, parseInt(P.get('res'),10) || 1080); resize();
+    }
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
       if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
@@ -3936,6 +4002,7 @@
         renderFrame(S, dt);
         vctx.drawImage(glCanvas, 0, 0, W, H);
         drawHUD({bass:0,mid:0,treb:0,energy:0}, now);
+        perfTick(dt*1000);   // measurable without audio, and pinned at renderScale 1.0
         requestAnimationFrame(idle);
       }
     })();
