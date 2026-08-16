@@ -8,6 +8,7 @@ scratchpad/
 img/
 inspiration/
 CLAUDE.md
+CLAUDE.md.tmp.*
 AGENTS.md
 __pycache__/
 *.pyc

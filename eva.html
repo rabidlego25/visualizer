@@ -1160,22 +1160,27 @@
   uniform vec2  u_res;
   uniform float u_time, u_bass, u_beat, u_burst, u_coil, u_safe, u_hue;
   uniform float u_cam, u_focal, u_psize, u_exposure;
+  uniform float u_yaw, u_pit;
   uniform float u_armTwist, u_shockR, u_shockA;
   uniform vec3  u_c1, u_c2;
   uniform sampler2D u_fft;
   ${COMMON}
   void main(){
-    // camera: a slow drift around the cloud, tilted, pulled in by heavy beats
-    float yaw = u_time*0.075 + u_bass*0.22;
-    float cy = cos(yaw), sy = sin(yaw);
+    // camera: a slow drift around the cloud, tilted, pulled in by heavy beats.
+    // yaw and pitch arrive as UNIFORMS rather than being computed here, and that is
+    // deliberate: simParticles() has to un-rotate the cursor by the same yaw to find the
+    // particles under the pointer, so the formula existed in two languages at once. That
+    // is exactly the WEB_XF/FRAG_WEB trap -- and the moment yaw became a shot parameter,
+    // a stale JS copy would have silently desynced the mouse from the picture. One source
+    // of truth now, and it is nebCamera() in JS.
+    float cy = cos(u_yaw), sy = sin(u_yaw);
     vec3 p = vec3(a_pos.x*cy + a_pos.z*sy, a_pos.y, -a_pos.x*sy + a_pos.z*cy);
     // pitch matters more than it looks: near edge-on the disc projects to a thin ellipse
     // and every particle overlaps every other one, which saturates to a white smear
     // Nearer face-on than before. Counter-intuitively this also REDUCES saturation:
     // edge-on stacks the whole disc along the view ray, face-on spreads it out. It is
     // also the only angle from which the spiral arms are legible at all.
-    float pit = 1.02 + sin(u_time*0.11)*0.16;
-    float cp = cos(pit), sp = sin(pit);
+    float cp = cos(u_pit), sp = sin(u_pit);
     p = vec3(p.x, p.y*cp - p.z*sp, p.y*sp + p.z*cp);
     float z = max(p.z + u_cam, 0.08);
     float f = u_focal / z;
@@ -2478,6 +2483,40 @@
   let fWidth = 1.0;                   // eased base-emitter width, 1.0 fed .. 6.0 starved
   let nebZoom = 1.0;                  // nebula framing multiplier on u_focal (?nzoom=)
 
+  // ---------------- the camera as a SHOT parameter ----------------
+  // The nebula is the only engine with a real 3D camera, which is the whole reason the
+  // camera-cut model starts here. A shot is an OFFSET on the standing drift, never a
+  // replacement for it: the drift keeps running underneath, so a cut moves the viewpoint
+  // while the sim continues uninterrupted. That is the point -- it deletes the cold-engine
+  // problem entirely (no warm-up, no lazy allocFluid hitch), because there is only ever
+  // one sim and it never stops.
+  // Shot 0 is all-zeros / all-ones, so with nothing armed this is byte-identical to the
+  // camera that shipped. Keep it that way: shot 0 is the baseline every A/B compares to.
+  const NEB_SHOTS = [
+    { yaw: 0.00, pit: 0.00, cam: 1.00, foc: 1.00 },   // 0  the established angle
+    { yaw: 2.10, pit:-0.34, cam: 0.72, foc: 1.18 },   // 1  close, swung round, flatter on the disc
+    // 2  high, looking down into the arms. It pulled back on cam AND foc at once at first,
+    //    which measured 55% coverage against 87% for the others and half the mean luma --
+    //    a cut to that reads as the visual DROPPING OUT, not as a wider shot, which is
+    //    exactly the misread the gate exists to measure. Keep every shot at a comparable
+    //    fill; the contrast belongs in the ANGLE.
+    { yaw:-1.30, pit: 0.30, cam: 1.15, foc: 1.02 },
+    { yaw: 3.05, pit: 0.12, cam: 0.90, foc: 1.06 },   // 3  the opposite side, near the same elevation
+  ];
+  let nebShot = 0;
+  // The ONE place the nebula camera is defined. Both the vertex shader (via u_yaw/u_pit)
+  // and simParticles()' cursor un-rotation read it from here.
+  function nebCamera(S){
+    const s = NEB_SHOTS[nebShot] || NEB_SHOTS[0];
+    return {
+      yaw: S.t*0.075 + S.bass*0.22 + s.yaw,
+      // pitch matters more than it looks -- see the note in VERT_PTS before changing it
+      pit: 1.02 + Math.sin(S.t*0.11)*0.16 + s.pit,
+      cam: (2.85 - S.beat*0.20*S.safe - S.burst*0.30) * s.cam,
+      foc: s.foc
+    };
+  }
+
   // Columns are spaced by a power curve, not linearly: a linear frequency axis spends
   // most of the frame on 10-20 kHz, where music has almost nothing, and crushes the
   // bass and low mids -- where all the visible structure actually is -- into a sliver.
@@ -2923,7 +2962,7 @@
     gl.uniform1f(U(progSim,'u_disc'), Math.max(0.30, 0.40 - S.bass*0.16 - S.burst*0.26));
     // put the cursor into world space on the camera plane (undo the render yaw), so the
     // particles it grabs are the ones actually under the pointer
-    const yaw = S.t*0.075 + S.bass*0.22, mx = mouse.x*2.4;
+    const yaw = nebCamera(S).yaw, mx = mouse.x*2.4;
     gl.uniform4f(U(progSim,'u_mouse'), mx*Math.cos(yaw), mouse.y*2.4, mx*Math.sin(yaw),
                  mouse.down ? 1 : (mouse.over ? 2 : 0));
 
@@ -3064,7 +3103,10 @@
     gl.uniform1f(U(progPts,'u_safe'), S.safe);
     gl.uniform1f(U(progPts,'u_hue'), S.hue);
     gl.uniform1f(U(progPts,'u_exposure'), S.expo);
-    gl.uniform1f(U(progPts,'u_cam'), 2.85 - S.beat*0.20*S.safe - S.burst*0.30);
+    const nc = nebCamera(S);
+    gl.uniform1f(U(progPts,'u_cam'), nc.cam);
+    gl.uniform1f(U(progPts,'u_yaw'), nc.yaw);
+    gl.uniform1f(U(progPts,'u_pit'), nc.pit);
     // A disc is round and a 9:16 frame is not. At 1080x1920 the cloud's light spanned
     // only 44% of the frame height, so more than half the frame was empty -- not a bug,
     // just geometry, and it is the format the app is actually for. So fill the LONG axis
@@ -3074,7 +3116,7 @@
     // 43% -> 65%, spill off the sides flat at 2.6% (so the arms are not being cropped),
     // and 0.00% clipped even at burst=1 on a drop, where the camera is already pulled in.
     const tall = Math.min(1, Math.max(0, (H/W - 1) / 0.78));   // 0 at square/landscape, 1 at 9:16
-    gl.uniform1f(U(progPts,'u_focal'), 1.25 * (1 + 0.6*tall) * nebZoom);
+    gl.uniform1f(U(progPts,'u_focal'), 1.25 * (1 + 0.6*tall) * nebZoom * nc.foc);
     gl.uniform1f(U(progPts,'u_psize'), 12.0 * (RH/1080));
     gl.uniform1f(U(progPts,'u_armTwist'), 1.9 + S.coil*1.1);
     gl.uniform1f(U(progPts,'u_shockR'), shockR);
@@ -3435,6 +3477,7 @@
     analyser.getByteTimeDomainData(timeData);
     const a = analyze(now, dt);
     recTick();                    // beat-locked cue-in / auto-stop at the clip length
+    cutTick();                    // the gate: fire a cut on the bar line (?cut=)
     const S = frameState((now-startT)/1000, a);
     if (modeId === 'web') updateNet(dt, inputGain);
     renderFrame(S, dt);
@@ -3581,6 +3624,42 @@
     const v = clipSel.value;
     return v === 's60' ? 60 : v === 's90' ? 90 : 0;
   }
+  // ---------------- THE GATE ----------------
+  // Auto Loop rests on one assumption with no evidence behind it: that a cut landing on a
+  // bar line reads as an intentional EDIT rather than as a glitch. Everything above rung 1
+  // depends on it and nobody has ever watched it happen. This is the minimum apparatus for
+  // settling that, and nothing more -- three takes of the same 8 bars against a real track:
+  //   ?cut=off      A  hold one engine, no cuts               (the baseline)
+  //   ?cut=engine   B  cut between ENGINES at bar N           (a scene change)
+  //   ?cut=camera   C  cut between camera ANGLES at bar N     (an angle on one subject)
+  // A-vs-B alone could kill the direction for the wrong reason, which is exactly why C
+  // exists. This is deliberately NOT a shot system; build that only if C wins.
+  const cuts = { mode:'off', bar:4, bars:0, prevBeat:-1 };
+  function fireCut(){
+    // sequential, not random: the whole value of these takes is that they are comparable,
+    // and one 8-bar take contains exactly ONE cut, so a random pick is a sample of size 1.
+    if (cuts.mode === 'camera'){
+      if (modeId !== 'nebula') return;      // only engine with a camera to cut between
+      nebShot = (nebShot + 1) % NEB_SHOTS.length;
+    } else if (cuts.mode === 'engine'){
+      const opts = [...modeSel.options].map(o => o.value);
+      const i = opts.indexOf(modeId);
+      if (opts.length < 2) return;
+      modeSel.value = opts[(i + 1) % opts.length];
+      modeSel.dispatchEvent(new Event('change'));   // carries clearTrails() + the slider relabel
+    }
+  }
+  // Counts bar lines off the same grid recTick() cues from, so a cut and the take that
+  // contains it can never disagree about where a bar starts.
+  function cutTick(){
+    if (cuts.mode === 'off' || !beatPeriod) return;
+    if (beatCount === cuts.prevBeat) return;
+    const wrapped = cuts.prevBeat === 3 && beatCount === 0;
+    cuts.prevBeat = beatCount;
+    if (!wrapped) return;
+    if (++cuts.bars % cuts.bar === 0) fireCut();
+  }
+
   // Called every frame while armed: begin exactly on the next downbeat.
   function recTick(){
     if (recArmed){
@@ -3802,6 +3881,18 @@
     // whole diagnosis when the frame rate is pinned.
     if (P.has('res') && !P.has('test')){
       baseRes = Math.max(180, parseInt(P.get('res'),10) || 1080); resize();
+    }
+    // The gate (see cuts, above). These sit OUTSIDE ?test= on purpose: the takes are
+    // recorded through the normal UI with a real track loaded and a human watching, which
+    // is the only instrument that can answer the question. A harness state cannot.
+    //   ?cut=camera&cutbar=4   ?cut=engine&cutbar=4   ?shot=2 (hold one angle, no cutting)
+    if (P.has('cut')){
+      const m = P.get('cut');
+      cuts.mode = (m === 'engine' || m === 'camera') ? m : 'off';
+      cuts.bar  = Math.max(1, parseInt(P.get('cutbar'), 10) || 4);
+    }
+    if (P.has('shot')){
+      nebShot = Math.max(0, Math.min(NEB_SHOTS.length-1, parseInt(P.get('shot'),10) || 0));
     }
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
