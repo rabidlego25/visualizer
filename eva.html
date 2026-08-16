@@ -3891,6 +3891,16 @@
       cuts.mode = (m === 'engine' || m === 'camera') ? m : 'off';
       cuts.bar  = Math.max(1, parseInt(P.get('cutbar'), 10) || 4);
     }
+    // ?mode= on the LIVE path too, not just under ?test=. Take C of the gate is
+    // "?mode=nebula&cut=camera", and a camera cut is a no-op outside the nebula -- so
+    // without this the take silently measures nothing. Goes through the select's change
+    // event rather than assigning modeId, so clearTrails() and the slider relabel come
+    // with it, and an option the device does not support (water is shelved, fluid needs
+    // HALF_FLOAT) is simply absent and correctly ignored.
+    if (P.has('mode') && !P.has('test')){
+      const opt = modeSel.querySelector(`option[value="${CSS.escape(P.get('mode'))}"]`);
+      if (opt){ modeSel.value = opt.value; modeSel.dispatchEvent(new Event('change')); }
+    }
     if (P.has('shot')){
       nebShot = Math.max(0, Math.min(NEB_SHOTS.length-1, parseInt(P.get('shot'),10) || 0));
     }
