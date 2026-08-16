@@ -1,8 +1,9 @@
 // Service worker: cache the app shell so it installs & runs offline.
 // Bump CACHE to force clients to pull fresh assets after a deploy.
-const CACHE = 'visualizer-v1';
+const CACHE = 'visualizer-v2';
 const ASSETS = [
   './', './index.html', './eva.html', './pulse.html', './manifest.json',
+  './palette.js',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'
 ];
 

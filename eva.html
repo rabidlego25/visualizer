@@ -128,6 +128,11 @@
     <div class="group">
       <label class="filebtn" for="fileInput">▷ Load</label>
       <input type="file" id="fileInput" accept="audio/*">
+      <!-- Sits in the LOAD group rather than getting a row of its own: the control bar is
+           above the stage, so every new row shrinks the live preview on a phone, which is
+           the primary device for posting. -->
+      <label class="filebtn" for="artInput" title="Take the palette from your cover art — the visuals then match your single instead of this app">◧ Art</label>
+      <input type="file" id="artInput" accept="image/*">
       <button id="micBtn">◉ Mic</button>
       <button id="playBtn" class="primary" disabled>▶ Play</button>
     </div>
@@ -208,6 +213,7 @@
   const vctx      = view.getContext('2d');
   const hint      = document.getElementById('hint');
   const fileInput = document.getElementById('fileInput');
+  const artInput  = document.getElementById('artInput');
   const micBtn    = document.getElementById('micBtn');
   const playBtn   = document.getElementById('playBtn');
   const themeSel  = document.getElementById('themeSel');
@@ -242,6 +248,64 @@
     { c1:[1.0,0.25,0.15], c2:[0.55,0.02,0.02], hud:'#ff4530' }, // Blood
     { c1:[1.0,0.82,0.20], c2:[1.0,0.12,0.70], hud:'#ffcf3a' }, // Testify (gold + magenta, hyper-vivid)
   ];
+
+  // ---------------- COVER ART -> the palette ----------------
+  // The NERV chrome is the app's identity; it is not the USER's, and nobody posts their
+  // own single branded as somebody else's world. The cheapest fix is not a fifth engine --
+  // it is the palette, because the palette multiplies across all four engines at once and
+  // does the one thing an engine cannot: make the output look like this track.
+  //
+  // palette.js holds the actual extraction and is a pure function of RGBA bytes, so it is
+  // tested against images whose answer is known by construction (tools/test_palette.mjs).
+  // Everything here is plumbing: decode, hand over pixels, install the result.
+  const COVER_IDX = THEMES.length;      // the extracted theme is appended, never replaces
+  let coverInfo = null;
+  // Fetched on demand, the same way analysis.js is: a user who never touches cover art
+  // should not pay for it on page load.
+  function withPalette(cb){
+    if (self.CoverPalette) return cb();
+    const s = document.createElement('script');
+    s.src = 'palette.js';
+    s.onload = () => cb();
+    s.onerror = () => hintFlash('PALETTE MODULE FAILED TO LOAD');
+    document.head.appendChild(s);
+  }
+  function installCover(th, label){
+    THEMES[COVER_IDX] = { c1: th.c1, c2: th.c2, hud: th.hud };
+    coverInfo = th.info || null;
+    let opt = themeSel.querySelector('option[value="' + COVER_IDX + '"]');
+    if (!opt){ opt = document.createElement('option'); opt.value = String(COVER_IDX); themeSel.appendChild(opt); }
+    opt.textContent = String(COVER_IDX + 1).padStart(2, '0') + ' · ' + (label || 'Cover') + ' ◧';
+    themeSel.value = String(COVER_IDX);
+    themeSel.dispatchEvent(new Event('change'));
+  }
+  function applyCover(src, label){
+    withPalette(() => {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.onload = () => {
+        // 320px on the long side. palette.js subsamples anyway, so decoding a 3000px
+        // sleeve at full size to build a histogram is pure cost.
+        const k = Math.min(1, 320/Math.max(im.width, im.height, 1));
+        const cw = Math.max(1, Math.round(im.width*k)), ch = Math.max(1, Math.round(im.height*k));
+        const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
+        cv.getContext('2d').drawImage(im, 0, 0, cw, ch);
+        let px;
+        try { px = cv.getContext('2d').getImageData(0, 0, cw, ch).data; }
+        catch(e){ hintFlash('COULD NOT READ THAT IMAGE'); return; }   // tainted canvas
+        if (im.src.startsWith('blob:')) URL.revokeObjectURL(im.src);
+        const th = self.CoverPalette.extract(px, cw, ch);
+        // An honest null. A greyscale sleeve has no palette to take, and inventing one is
+        // worse than leaving the user on the theme they already chose.
+        if (!th){ hintFlash('NO COLOUR IN THAT ARTWORK — PALETTE UNCHANGED'); return; }
+        installCover(th, label);
+        hintFlash('PALETTE FROM COVER — ' + th.hud.toUpperCase()
+                  + (th.info.synthesised ? ' (ONE-HUE SLEEVE)' : ''));
+      };
+      im.onerror = () => hintFlash('COULD NOT LOAD THAT IMAGE');
+      im.src = typeof src === 'string' ? src : URL.createObjectURL(src);
+    });
+  }
 
   // ---------------- Audio ----------------
   let audioCtx=null, analyser=null, sourceNode=null, mediaEl=null, mediaElSrc=null, micStream=null;
@@ -3852,6 +3916,10 @@
 
   // ---------------- Events ----------------
   fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  artInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (f) applyCover(f, (f.name || 'Cover').replace(/\.[^.]+$/, '').slice(0, 14) || 'Cover');
+  });
   micBtn.addEventListener('click', useMic);
   playBtn.addEventListener('click', play);
   recBtn.addEventListener('click', () => {
@@ -4021,11 +4089,41 @@
     // Rung 1. `?env=0` is the A/B baseline (the look as it shipped); `?envbars=N` runs the
     // cycle at a fixed length without touching the clip select, so the envelope can be
     // previewed or measured independently of what is being recorded.
+    // Cover art. `?art=<url>` drives the whole real path (decode -> extract -> install)
+    // so a browser probe can check the plumbing; `?c1=&c2=` installs colours DIRECTLY,
+    // which is what an offline render harness needs -- it separates "did we pick the
+    // right colours" (pure, covered in Node) from "does the frame clip when we do",
+    // which can only be answered by rendering and is the failure mode that actually
+    // bites here. An async image decode inside the ?test= path would race the harness.
+    if (P.has('c1') && P.has('c2')){
+      // Validated, because an unparseable value here yields NaN components, and a NaN
+      // uniform does not throw -- it renders a colourless frame that looks like a real
+      // result. Found exactly that way: a shell loop passed empty values and four
+      // "different" palettes came back identical and grey.
+      const rgb = s => { const m = /^#?([0-9a-fA-F]{6})$/.exec(s || '');
+                         if (!m) return null;
+                         const v = parseInt(m[1], 16);
+                         return [(v>>16 & 255)/255, (v>>8 & 255)/255, (v & 255)/255]; };
+      const a1 = rgb(P.get('c1')), a2 = rgb(P.get('c2'));
+      if (a1 && a2) installCover({ c1: a1, c2: a2, hud: '#' + P.get('c1').replace('#','') }, 'Test');
+      else console.warn('eva: ?c1=/?c2= need 6-digit hex; palette unchanged');
+    } else if (P.has('art')){
+      applyCover(P.get('art'), 'Cover');
+    }
     if (P.has('env'))     envOn = P.get('env') !== '0';
     if (P.has('envbars')) envBars = Math.max(1, parseInt(P.get('envbars'),10) || 0);
     // Observability: directed and undirected look similar on a steady passage, so a
     // silently-inert envelope would be indistinguishable from a subtle one. Same reason
     // __dirState exists.
+    // Same reason as __loopState: an extraction that silently did nothing and one that
+    // produced a subtle palette look identical from outside.
+    window.__coverState = () => ({
+      installed: !!THEMES[COVER_IDX],
+      selected: +themeSel.value === COVER_IDX,
+      options: themeSel.options.length,
+      hud: THEMES[COVER_IDX] ? THEMES[COVER_IDX].hud : '',
+      info: coverInfo
+    });
     window.__loopState = () => ({
       on: loopEnv.amt > 0, amt: +loopEnv.amt.toFixed(4), bars: loopEnv.bars,
       bar: loopEnv.bar, p: +loopEnv.p.toFixed(4),
@@ -4038,8 +4136,15 @@
       if (P.has('hud'))    hudOn = tp('hud',1) > 0.5;
       if (P.has('title'))  titleIn.value  = P.get('title');
       if (P.has('artist')) artistIn.value = P.get('artist');
-      const th = THEMES[Math.max(0, Math.min(THEMES.length-1, tp('theme',0)|0))];
-      themeSel.value = String(THEMES.indexOf(th));
+      // Only when asked. An unconditional assignment here would clobber a palette
+      // installed by ?c1=&c2= above, silently rendering every cover-art check against
+      // theme 0 -- i.e. measuring the feature switched off, which is exactly the trap
+      // ?test= already fell into with the loop envelope.
+      if (P.has('theme')){
+        const ti = Math.max(0, Math.min(THEMES.length-1, tp('theme',0)|0));
+        themeSel.value = String(ti);
+      }
+      const th = THEMES[+themeSel.value];   // whatever is selected, cover palette included
       safe  = tp('safe',0) > 0.5;
       netOn = tp('net',1) > 0.5;
       if (P.has('mode')){
