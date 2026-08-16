@@ -1720,7 +1720,14 @@
     // suspect: grain and scanline are both high-frequency texture, which is precisely what
     // the eye reads as sharpness -- so a pixel-perfect take still looks softer than the
     // preview, before the encoder has touched anything.
-    const asRec = recording || recFX;
+    const asRec = recFXOv === null ? recording : recFXOv;
+    // Backing grain off for a take turns out to change NOTHING in the delivered file, and
+    // that is worth knowing rather than re-litigating. Measured end to end on identical
+    // content: restoring full grain for the take delivered laplacian 0.04364 against
+    // 0.04378 for the shipped setting -- identical. The encoder removes fine random noise
+    // whatever we do, because it is the least compressible thing in the frame and rate
+    // control drops it first. So this line costs the user nothing and it is kept; but do
+    // not expect changing it to sharpen an export, and do not "fix" softness here.
     gl.uniform1f(U(progPost,'u_grain'), asRec ? 0.005 : 0.018);
     // ~3.6px per line at 1080p, and shallower on a take -- high-contrast 1px detail is
     // the first thing a codec turns into shimmer, and it eats the bitrate too
@@ -1732,6 +1739,13 @@
     // aberration downstream. Measured on a waterfall frame: at 0.14 the 6px component is
     // 29.5% of the vertical spectrum; at 0.02 it is 4.4%.
     const fullFrameMode = (modeId === 'water' || modeId === 'fluid');
+    // The scanline DOES stay backed off, and this is the asymmetry worth understanding:
+    // it is a ~6px near-Nyquist pattern, so 4:2:0 chroma subsampling turns fine luma detail
+    // into COLOURED fringing -- the "really small hyperfine colored lines" already reported
+    // here once. Measured in the delivered file, restoring it takes the 6px band from
+    // 1.32% to 3.20% of the vertical spectrum, 2.4x. Grain is broadband and survives;
+    // the scanline is one frequency sitting where the codec is weakest. Different physics,
+    // so they get different answers rather than one blanket "soften the take" rule.
     gl.uniform1f(U(progPost,'u_scan'),  asRec ? 0.06 : (fullFrameMode ? 0.05 : 0.14));
     gl.uniform1f(U(progPost,'u_scanN'), 300.0);
     drawQuad();
@@ -3606,7 +3620,10 @@
   // read by adaptResolution() and the grain in postProcess() -- a take must not be
   // degraded by the things that keep the LIVE view smooth
   let recording=false;
-  let recFX=false;      // ?recfx=1 -- preview the take-time look without recording
+  // ?recfx=1 previews the take-time look without recording; ?recfx=0 FORCES IT OFF even
+  // while recording, so "would keeping the preview's grain and scanline actually cost us
+  // anything at 40 Mbps?" is a measurable question rather than an assumption.
+  let recFXOv=null;     // null = normal, true = force on, false = force off
   let recPref='';       // ?rec=webm|mp4 -- force the codec, to test the H.264 quality cap
   // transient overlay message (tempo warnings and the like), auto-clears
   let hintFlashT = null;
@@ -3912,7 +3929,7 @@
     // event rather than assigning modeId, so clearTrails() and the slider relabel come
     // with it, and an option the device does not support (water is shelved, fluid needs
     // HALF_FLOAT) is simply absent and correctly ignored.
-    if (P.has('recfx')) recFX = P.get('recfx') !== '0';
+    if (P.has('recfx')) recFXOv = P.get('recfx') !== '0';
     if (P.has('rec')){ const v = P.get('rec'); if (v === 'webm' || v === 'mp4') recPref = v; }
     if (P.has('mode') && !P.has('test')){
       const opt = modeSel.querySelector(`option[value="${CSS.escape(P.get('mode'))}"]`);
