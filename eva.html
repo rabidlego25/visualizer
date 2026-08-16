@@ -188,6 +188,7 @@
           <option value="s90">Reel · 90s</option>
         </select>
       </label>
+      <button id="loopBtn" disabled title="Shortlist the cleanest loop windows in this track and cue one up with a bar of lead-in. Press again for the next candidate.">⌖ Loop</button>
       <button id="safeAreaBtn" title="Show where Instagram's caption and buttons cover a Reel (never recorded)">⌗ Guides</button>
       <button id="recBtn" class="rec" disabled>● Rec</button>
       <span id="recDot"></span>
@@ -226,6 +227,7 @@
   const hudBtn    = document.getElementById('hudBtn');
   const randBtn   = document.getElementById('randBtn');
   const clipSel   = document.getElementById('clipSel');
+  const loopBtn   = document.getElementById('loopBtn');
   const safeAreaBtn = document.getElementById('safeAreaBtn');
   const recDot    = document.getElementById('recDot');
   const timerEl   = document.getElementById('timer');
@@ -355,7 +357,8 @@
     mediaEl.onended = () => { playBtn.textContent='▶ Play'; };
     sourceNode = mediaElSrc;
     connect(sourceNode, true);
-    playBtn.disabled=false; recBtn.disabled=false;
+    playBtn.disabled=false; recBtn.disabled=false; loopBtn.disabled=false;
+    loopCands = null; loopKey = ''; loopIdx = -1;   // a shortlist belongs to one track
     fpReset(file.name);
     director.analyse(file);
     hint.classList.add('hidden'); startLoop(); play();
@@ -3787,6 +3790,66 @@
     const v = clipSel.value;
     return v === 's60' ? 60 : v === 's90' ? 90 : 0;
   }
+  // ---------------- LOOP FINDER (plan.js) ----------------
+  // plan.js has been finished and green for a while and was consumed by nothing but its
+  // own test. This wires it in, and it is the module the whole analysis stack cashes out
+  // through: at 8 bars the beat grid and downbeats are load-bearing, but `approach()`
+  // rarely matters (there is usually no drop *inside* the clip) and key->hue has been
+  // superseded by cover art. Choosing WHICH bars is what HPSS/Ellis/Foote actually buy.
+  //
+  // SCOPED HONESTLY: this is a ranked SHORTLIST, not an auto-editor. "Which 8 bars should
+  // you post" is a question the artist answers instantly and better -- they know their own
+  // track. What a human cannot eyeball is which downbeat-aligned window has the best
+  // energy MATCH between its first and last bar, which is exactly what pickLoop scores,
+  // and it already returns the best few rather than one answer. So: three candidates,
+  // cycled, cued up. The user still decides.
+  let loopCands = null, loopKey = '', loopIdx = -1;
+  function withPlan(cb){
+    if (self.SongPlan) return cb();
+    const s = document.createElement('script');
+    s.src = 'plan.js';
+    s.onload = () => cb();
+    s.onerror = () => hintFlash('LOOP PLANNER FAILED TO LOAD');
+    document.head.appendChild(s);
+  }
+  // Seek ONE BAR EARLY, and this is the whole subtlety. Bar-locked recording ARMS and
+  // cues in on the next downbeat (see recTick), so cueing exactly to the window start
+  // would make Rec catch the downbeat AFTER it -- the take would be one bar off the plan,
+  // silently. A bar of lead-in makes the arming land on the planned downbeat, and doubles
+  // as a count-in, which is what a musician expects anyway.
+  function loopCueTime(startSec, beatPeriodSec){
+    return Math.max(0, startSec - beatPeriodSec*4);
+  }
+  function findLoops(){
+    const bars = clipBars();
+    if (!bars){ hintFlash('PICK A BAR-LOCKED CLIP LENGTH FIRST'); return; }
+    if (!director.ready || !director.tl){
+      hintFlash(director.status ? 'STILL ANALYSING — TRY AGAIN IN A MOMENT' : 'NO ANALYSIS FOR THIS TRACK');
+      return;
+    }
+    withPlan(() => {
+      // Recompute when the clip length changes: an 8-bar shortlist is not a 16-bar one.
+      const key = bars + ':' + (director.tl.beats ? director.tl.beats.length : 0);
+      if (loopKey !== key){
+        loopCands = self.SongPlan.pickLoop(director.tl, { bars: bars, top: 3 });
+        loopKey = key; loopIdx = -1;
+      }
+      if (!loopCands || !loopCands.length){
+        hintFlash('TRACK IS TOO SHORT FOR A ' + bars + '-BAR LOOP'); return;
+      }
+      loopIdx = (loopIdx + 1) % loopCands.length;
+      const c = loopCands[loopIdx];
+      const bp = (director.tl.tempo && director.tl.tempo.beatPeriod) || beatPeriod || 0.5;
+      if (mediaEl){
+        mediaEl.currentTime = loopCueTime(c.start, bp);
+        if (mediaEl.paused) play();
+      }
+      hintFlash('LOOP ' + (loopIdx+1) + '/' + loopCands.length + ' · ' + fmt(c.start)
+                + ' · JOIN ' + c.join.toFixed(2) + (c.label ? ' · ' + c.label : '')
+                + ' — HIT REC');
+    });
+  }
+
   // ---------------- THE GATE ----------------
   // Auto Loop rests on one assumption with no evidence behind it: that a cut landing on a
   // bar line reads as an intentional EDIT rather than as a glitch. Everything above rung 1
@@ -3954,6 +4017,7 @@
     applySlider();
     setTrails(Math.random() < 0.5);
   });
+  loopBtn.addEventListener('click', findLoops);
   safeAreaBtn.addEventListener('click', () => {
     safeArea = !safeArea;
     safeAreaBtn.classList.toggle('primary', safeArea);
