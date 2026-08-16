@@ -2510,6 +2510,55 @@
   let fWidth = 1.0;                   // eased base-emitter width, 1.0 fed .. 6.0 starved
   let nebZoom = 1.0;                  // nebula framing multiplier on u_focal (?nzoom=)
 
+  // ---------------- RUNG 1: the periodic look envelope ----------------
+  // Bar-locked recording makes the AUDIO loop; the visuals do not, so the seam is
+  // continuity. That cannot be fixed in general: the force-directed web, the fluid and
+  // the particle nebula all integrate forward forever, so no sim here ever returns to a
+  // previous state. What CAN be fixed is everything that is a plain function of TIME --
+  // the camera drift and the palette. Drive those from the position within the LOOP
+  // instead, and the look literally returns even though the state does not.
+  //
+  // Two basis functions, both periodic AND smooth across the join:
+  //   sway = sin(2pi*p)          0 at both ends, slope 2pi at both
+  //   rise = (1-cos(2pi*p))/2    0 at both ends, slope 0 at both
+  // Matching the SLOPE matters as much as matching the value: a parameter that returns
+  // but arrives with a kink still reads as a bump on the downbeat, which is the exact
+  // artefact this exists to delete.
+  //
+  // This is the rung of the fallback ladder that survives every outcome of the gate --
+  // it makes no claim that a discontinuity reads as an edit, it just removes one.
+  const LOOP_EASE = 2.5;         // seconds to fade in/out (see loopTick: never mid-take)
+  const LOOP_YAW  = 0.55;        // rad, peak camera sway. ~the range the old drift covered
+  const LOOP_PIT  = 0.16;        // rad, matches the amplitude of the drift it replaces
+  const LOOP_FOC  = 0.10;        // gentle push-in, peaking mid-loop
+  const LOOP_HUE  = 0.18;        // rad of palette rotation; harmHue itself is bounded ~0.28
+  let envOn = true, envBars = 0; // ?env=0 disables, ?envbars=N overrides the clip length
+  const loopEnv = { amt: 0, bars: 0, bar: 0, prevBeat: -1, p: 0, sway: 0, rise: 0 };
+  function loopTick(dt){
+    // Same gate recTick() arms on: below that confidence the bar line is guesswork, and
+    // an envelope keyed to a wrong grid is worse than no envelope at all.
+    const bars = envBars || clipBars();
+    const armed = envOn && bars > 0 && bpmConf > 0.30 && beatPeriod > 0;
+    if (armed){
+      if (loopEnv.bars !== bars){ loopEnv.bars = bars; loopEnv.bar = 0; }
+      if (beatCount !== loopEnv.prevBeat){
+        const wrapped = loopEnv.prevBeat === 3 && beatCount === 0;
+        loopEnv.prevBeat = beatCount;
+        if (wrapped) loopEnv.bar = (loopEnv.bar + 1) % bars;
+      }
+      loopEnv.p = (loopEnv.bar + barPhase) / bars;
+    } else {
+      loopEnv.prevBeat = -1; loopEnv.bar = 0; loopEnv.p = 0;
+    }
+    // Acquiring (or losing) the tempo lock part-way through a track must not JUMP the
+    // camera, so consumers cross-fade on amt rather than switching. beginRec() snaps it
+    // to 1, because a take has to be exactly periodic or the whole point is lost.
+    loopEnv.amt = Math.max(0, Math.min(1, loopEnv.amt + (armed ? dt : -dt)/LOOP_EASE));
+    const th = loopEnv.p * Math.PI * 2;
+    loopEnv.sway = Math.sin(th);                 // NOT pre-scaled by amt -- the camera
+    loopEnv.rise = 0.5 - 0.5*Math.cos(th);       // mixes, it does not just add
+  }
+
   // ---------------- the camera as a SHOT parameter ----------------
   // The nebula is the only engine with a real 3D camera, which is the whole reason the
   // camera-cut model starts here. A shot is an OFFSET on the standing drift, never a
@@ -2535,12 +2584,24 @@
   // and simParticles()' cursor un-rotation read it from here.
   function nebCamera(S){
     const s = NEB_SHOTS[nebShot] || NEB_SHOTS[0];
+    // Rung 1: cross-fade the TIME-derived drift over to the LOOP-derived one. At amt=0
+    // these are byte-identical to the camera that shipped, which is the same discipline
+    // shot 0 is held to -- every A/B needs a baseline that means something.
+    // S.bass and S.beat are left reactive on purpose: the audio genuinely loops, so they
+    // already return at the seam on their own.
+    const a = loopEnv.amt;
+    const yawT = a ? S.t*0.075*(1-a) + loopEnv.sway*LOOP_YAW*a : S.t*0.075;
+    const pitT = a ? Math.sin(S.t*0.11)*0.16*(1-a) + loopEnv.sway*LOOP_PIT*a
+                   : Math.sin(S.t*0.11)*0.16;
     return {
-      yaw: S.t*0.075 + S.bass*0.22 + s.yaw,
+      yaw: yawT + S.bass*0.22 + s.yaw,
       // pitch matters more than it looks -- see the note in VERT_PTS before changing it
-      pit: 1.02 + Math.sin(S.t*0.11)*0.16 + s.pit,
+      pit: 1.02 + pitT + s.pit,
       cam: (2.85 - S.beat*0.20*S.safe - S.burst*0.30) * s.cam,
-      foc: s.foc
+      // push in and back out over the cycle. Zooming IN spreads the particles over more
+      // pixels, so this reduces additive pile-up rather than adding to it -- the safe
+      // direction, given brightness is the recurring failure mode here.
+      foc: s.foc * (1 + loopEnv.rise*LOOP_FOC*a)
     };
   }
 
@@ -3251,12 +3312,17 @@
   // the per-frame state every mode and the post chain reads
   function frameState(t, a){
     const th = THEMES[+themeSel.value];
+    // Rung 1's only UNIVERSAL lever. The nebula is the one engine with a real camera, so
+    // it is the only one whose framing can be made to return; the palette is a plain
+    // function of time in all four, so all four get this. Purely additive, so it fades in
+    // from nothing and is exactly 0 with the envelope off.
+    const hue = harmHue + loopEnv.sway*LOOP_HUE*loopEnv.amt;
     return {
       t, bass:a.bass, mid:a.mid, treb:a.treb, beat,
       coil, burst, expo: exposure(a.energy), safe: safeVal(),
       // the harmonic drift is baked into c1/c2 here, so u_hue only carries the
       // PER-PARTICLE spread (speed/seed) -- adding harmHue again would double-shift
-      c1: shiftHue(th.c1, harmHue), c2: shiftHue(th.c2, harmHue), hue: 0
+      c1: shiftHue(th.c1, hue), c2: shiftHue(th.c2, hue), hue: 0
     };
   }
   // CPU-side twin of the shader's hueShift -- lets the harmonic drift be baked into
@@ -3505,6 +3571,7 @@
     const a = analyze(now, dt);
     recTick();                    // beat-locked cue-in / auto-stop at the clip length
     cutTick();                    // the gate: fire a cut on the bar line (?cut=)
+    loopTick(dt);                 // rung 1: advance the periodic look envelope
     const S = frameState((now-startT)/1000, a);
     if (modeId === 'web') updateNet(dt, inputGain);
     renderFrame(S, dt);
@@ -3723,6 +3790,13 @@
   }
   function beginRec(){
     const bars = clipBars(), lim = clipLimit();
+    // Rung 1: start the envelope's cycle HERE. This is the downbeat recTick() cued on, so
+    // p runs 0 -> 1 across exactly the bars being recorded and the last frame of the file
+    // lands back on the first frame's look. Snapped rather than eased for the same reason:
+    // a take that is only approximately periodic is not periodic.
+    if (bars && loopEnv.amt > 0){
+      loopEnv.bar = 0; loopEnv.prevBeat = beatCount; loopEnv.p = 0; loopEnv.amt = 1;
+    }
     // whole bars at the detected tempo, or the platform's hard ceiling
     recStopAt = bars && beatPeriod > 0 ? performance.now() + bars*4*beatPeriod*1000
               : lim ? performance.now() + lim*1000 : 0;
@@ -3944,6 +4018,19 @@
     if (P.has('shot')){
       nebShot = Math.max(0, Math.min(NEB_SHOTS.length-1, parseInt(P.get('shot'),10) || 0));
     }
+    // Rung 1. `?env=0` is the A/B baseline (the look as it shipped); `?envbars=N` runs the
+    // cycle at a fixed length without touching the clip select, so the envelope can be
+    // previewed or measured independently of what is being recorded.
+    if (P.has('env'))     envOn = P.get('env') !== '0';
+    if (P.has('envbars')) envBars = Math.max(1, parseInt(P.get('envbars'),10) || 0);
+    // Observability: directed and undirected look similar on a steady passage, so a
+    // silently-inert envelope would be indistinguishable from a subtle one. Same reason
+    // __dirState exists.
+    window.__loopState = () => ({
+      on: loopEnv.amt > 0, amt: +loopEnv.amt.toFixed(4), bars: loopEnv.bars,
+      bar: loopEnv.bar, p: +loopEnv.p.toFixed(4),
+      sway: +loopEnv.sway.toFixed(4), rise: +loopEnv.rise.toFixed(4)
+    });
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
       if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
@@ -4151,6 +4238,22 @@
           gl.activeTexture(gl.TEXTURE0);
           gl.bindTexture(gl.TEXTURE_2D, fftTex);
           gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, freqData.length, 1, gl.RED, gl.UNSIGNED_BYTE, freqData);
+        }
+        // `&envbars=N` under ?test= drives rung 1 off a synthetic 120 BPM grid. Without
+        // this the envelope is invisible to every offline harness -- the test loop builds
+        // its own S and calls renderFrame() directly, so loopTick() is never reached and
+        // amt stays 0. That is fine for the CUT layer (pure timing, covered in Node) but
+        // not for this one, which moves the camera and the palette: brightness and frame
+        // fill are the recurring failure mode here and they have to be measurable.
+        if (envBars){
+          const u = tf + _tframes/60;
+          bpmConf = 1; beatPeriod = 0.5;
+          const b = u/beatPeriod;
+          beatCount = Math.floor(b) % 4; beatPhase = b % 1;
+          barPhase = (beatCount + beatPhase)/4;
+          loopTick(1/60);
+          loopEnv.amt = 1;   // skip the ease: a harness wants the steady state, and 2.5s
+                             // of ramp is 150 of the frames a filmstrip would sample
         }
         renderFrame(S, 1/60);
         vctx.drawImage(glCanvas, 0, 0, W, H);
