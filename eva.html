@@ -1714,7 +1714,14 @@
     // Per-frame random grain is the worst case for a video codec -- it is new detail in
     // every frame, so it eats the bitrate that should be describing the actual image.
     // Back it off while recording; on screen it stays at full strength.
-    gl.uniform1f(U(progPost,'u_grain'), recording ? 0.005 : 0.018);
+    // `?recfx=1` applies the take-time look WITHOUT recording, so the difference between
+    // what you tune and what you ship is measurable (and previewable). The user reported
+    // "recording does not look as good as the visualization" and this branch is the first
+    // suspect: grain and scanline are both high-frequency texture, which is precisely what
+    // the eye reads as sharpness -- so a pixel-perfect take still looks softer than the
+    // preview, before the encoder has touched anything.
+    const asRec = recording || recFX;
+    gl.uniform1f(U(progPost,'u_grain'), asRec ? 0.005 : 0.018);
     // ~3.6px per line at 1080p, and shallower on a take -- high-contrast 1px detail is
     // the first thing a codec turns into shimmer, and it eats the bitrate too
     // The scanline is a 6.4px-period luma modulation (u_scanN=300 over a 1920 frame),
@@ -1725,7 +1732,7 @@
     // aberration downstream. Measured on a waterfall frame: at 0.14 the 6px component is
     // 29.5% of the vertical spectrum; at 0.02 it is 4.4%.
     const fullFrameMode = (modeId === 'water' || modeId === 'fluid');
-    gl.uniform1f(U(progPost,'u_scan'),  recording ? 0.06 : (fullFrameMode ? 0.05 : 0.14));
+    gl.uniform1f(U(progPost,'u_scan'),  asRec ? 0.06 : (fullFrameMode ? 0.05 : 0.14));
     gl.uniform1f(U(progPost,'u_scanN'), 300.0);
     drawQuad();
     gl.activeTexture(gl.TEXTURE0);
@@ -3599,6 +3606,8 @@
   // read by adaptResolution() and the grain in postProcess() -- a take must not be
   // degraded by the things that keep the LIVE view smooth
   let recording=false;
+  let recFX=false;      // ?recfx=1 -- preview the take-time look without recording
+  let recPref='';       // ?rec=webm|mp4 -- force the codec, to test the H.264 quality cap
   // transient overlay message (tempo warnings and the like), auto-clears
   let hintFlashT = null;
   function hintFlash(msg){
@@ -3706,9 +3715,15 @@
     const mixed = new MediaStream(tracks);
     // prefer MP4 (opens everywhere / socials / iOS); fall back to WebM where MP4
     // recording isn't supported (older Chrome/Firefox).
-    const mime = ['video/mp4;codecs=avc1.4d002a,mp4a.40.2','video/mp4;codecs=h264,aac','video/mp4',
-                  'video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm']
-                 .find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
+    // `?rec=webm` forces VP9 and `?rec=mp4` forces H.264. This exists because the repo has
+    // long recommended "if exports look soft, compare a WebM/VP9 take" to test whether
+    // Chrome's HARDWARE H.264 is quality-capping us regardless of the bitrate we ask for
+    // -- and there was no way to actually do that without editing this line. A documented
+    // diagnostic that cannot be run is not a diagnostic.
+    const MP4  = ['video/mp4;codecs=avc1.4d002a,mp4a.40.2','video/mp4;codecs=h264,aac','video/mp4'];
+    const WEBM = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+    const pref = recPref === 'webm' ? WEBM : recPref === 'mp4' ? MP4 : [...MP4, ...WEBM];
+    const mime = pref.find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
     recMime = mime;
     // 1080p60 of fine particle detail, scanlines and glow is close to worst-case for a
     // codec (lots of high-frequency, high-motion content), so it needs a fat bitrate.
@@ -3897,6 +3912,8 @@
     // event rather than assigning modeId, so clearTrails() and the slider relabel come
     // with it, and an option the device does not support (water is shelved, fluid needs
     // HALF_FLOAT) is simply absent and correctly ignored.
+    if (P.has('recfx')) recFX = P.get('recfx') !== '0';
+    if (P.has('rec')){ const v = P.get('rec'); if (v === 'webm' || v === 'mp4') recPref = v; }
     if (P.has('mode') && !P.has('test')){
       const opt = modeSel.querySelector(`option[value="${CSS.escape(P.get('mode'))}"]`);
       if (opt){ modeSel.value = opt.value; modeSel.dispatchEvent(new Event('change')); }
