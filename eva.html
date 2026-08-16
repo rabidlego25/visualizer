@@ -1720,7 +1720,13 @@
     // suspect: grain and scanline are both high-frequency texture, which is precisely what
     // the eye reads as sharpness -- so a pixel-perfect take still looks softer than the
     // preview, before the encoder has touched anything.
-    const asRec = recFXOv === null ? recording : recFXOv;
+    // THE PREVIEW SHOWS THE TAKE-TIME LOOK, ALWAYS. It used to show the richer version
+    // and then quietly hand you a softer file, which is how "the recording doesn't look as
+    // good as the visualization" happened: the grain and the scanline the preview was
+    // selling cannot survive the encoder (grain) or must not (scanline, 4:2:0 fringing).
+    // For a tool whose only output is the exported file, a preview that flatters itself is
+    // a defect. What you tune is now what you ship. `?recfx=0` restores the old preview.
+    const asRec = recFXOv === null ? true : recFXOv;
     // Backing grain off for a take turns out to change NOTHING in the delivered file, and
     // that is worth knowing rather than re-litigating. Measured end to end on identical
     // content: restoring full grain for the take delivered laplacian 0.04364 against
