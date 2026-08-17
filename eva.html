@@ -2413,6 +2413,9 @@
   // Kept deliberately SLOW and independent of webPace: the background drifts, the web
   // keeps its own speed. `?bgspin=` scales it (0 freezes the field, 1 ships).
   let bgPhase = 0, bgSpin = 1;
+  // how fast a node's wink resolves, 1/seconds. 16 was the shipped value and reads as a
+  // pop; 6 is ~170ms and reads as a glow. `?blink=` sweeps it.
+  let blinkFade = 6;
   function paceTarget(){
     if (paceOv != null) return paceOv;
     const m = director.ready && director.tl ? director.tl.mood : null;
@@ -2571,8 +2574,13 @@
           n.flash = 1;                                  // spark on transition
           n.tflip = 0.4 + Math.random()*2.6;
         }
-        n.vis += (n.vtar - n.vis) * Math.min(1, dt*16);  // fast fade in/out
-        n.flash *= 0.85;
+        // Nodes winking in and out is the firefly reading, but at dt*16 the fade is ~60ms,
+        // which is a POP -- the eye sees an appearance, not a glow. Slower, so a node
+        // swells and dies away. The spark that marks the transition decays gentler too,
+        // for the same reason: an abrupt highlight is what makes a soft event read as a
+        // snap. Neither changes WHEN a node flips, only how it arrives.
+        n.vis += (n.vtar - n.vis) * Math.min(1, dt*blinkFade);
+        n.flash *= 0.90;
       }
     }
     // Rewire periodically (and on a hard hit). This is the visible payoff of the solver:
@@ -4311,6 +4319,7 @@
     // them. Guarded against NaN like ?c1=/?pace= -- a NaN phase would freeze the field and
     // a NaN fade would leave every node stuck part-visible, neither of which throws.
     if (P.has('bgspin')){ const v = parseFloat(P.get('bgspin')); if (isFinite(v)) bgSpin = Math.max(0, Math.min(4, v)); }
+    if (P.has('blink')){  const v = parseFloat(P.get('blink'));  if (isFinite(v)) blinkFade = Math.max(1, Math.min(30, v)); }
 
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
