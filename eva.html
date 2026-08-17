@@ -1490,8 +1490,12 @@
   function perfTick(dtMs){
     if (fpsEl && (++fpsFrames % 15) === 0){
       const pct = Math.round(renderScale*100);
+      // pace is included because it now VARIES per track (mood.arousal) and eases over
+      // seconds, so "why is the web sluggish on this song" is otherwise unanswerable from
+      // the outside -- the same reason renderScale is here rather than left to be guessed.
       fpsEl.textContent = `${(1000/Math.max(frameMs,0.01)).toFixed(0)} fps  ${frameMs.toFixed(1)}ms  `
-        + `scale ${pct}%  ${Math.round(W*renderScale)}x${Math.round(H*renderScale)}`;
+        + `scale ${pct}%  ${Math.round(W*renderScale)}x${Math.round(H*renderScale)}`
+        + `  pace ${webPace.toFixed(2)}`;
       fpsEl.style.color = pct < 100 ? '#e2231a' : '#ffb45a';
     }
     if (!perfURL) return;
@@ -2369,6 +2373,31 @@
   let shapeSpin = 0, netTime = 0;   // accumulating figure rotation + local clock
   let testCoh = null, testShape = null;   // harness overrides so silhouettes can be screenshotted
 
+  // ---------------- MOOD -> PACE ----------------
+  // One scalar out of the timeline (analysis.js `mood.arousal`) sets how RESTLESS the web
+  // is. A slow, sustained, dark track drifts and rewires lazily; a fast percussive one
+  // stays agitated. It changes the pace of the motion, never its extent -- a calm song
+  // should still fill the frame, just stop fidgeting, so amplitude and the shell are
+  // untouched and only rates are scaled.
+  //
+  // It has to come from the TIMELINE and cannot come from the live meter: analyze() runs
+  // an AGC (agcEnv -> inputGain) that deliberately normalises loudness so tracks read
+  // consistently, which is correct for the reactive path and destroys exactly the
+  // dynamics an arousal estimate needs. analysis.js sees raw PCM before any of that.
+  //
+  // Eased, not switched, for the same reason nebCamera() cross-fades: analysis lands a
+  // second or two into a track and the web must not visibly change gear when it does.
+  // At pace 1 every expression below is byte-identical to what shipped, so `?pace=1` is
+  // the honest A/B baseline.
+  const PACE_EASE = 3.0;                  // seconds to take up a change in arousal
+  let webPace = 1, paceOv = null;         // paceOv: ?pace= harness override
+  function paceTarget(){
+    if (paceOv != null) return paceOv;
+    const m = director.ready && director.tl ? director.tl.mood : null;
+    if (!m || typeof m.arousal !== 'number') return 1;   // mic, or pre-analysis: no-op
+    return 0.55 + m.arousal * 0.75;                      // 0.55 (still) .. 1.30 (agitated)
+  }
+
   function updateNet(dt, gain){
     const [hw, hh] = webExtent();           // uv half-extents (web spreads across the frame)
     // syncRatio gently swells/settles the whole web's energy on its own -- the
@@ -2394,7 +2423,15 @@
     if (testCoh != null) coh = testCoh;
     // figure rotation: geometric Angels tumble (rate rises with bass + beat);
     // humanoid forms (spin 0) rock gently so they never flip upside-down.
-    netTime += dt;
+    // pace first: netTime drives the wander frequency, the coil tremble and the figure
+    // sway, so scaling the clock slows all three coherently rather than one at a time
+    // `?pace=` SNAPS rather than eases, for the same reason beginRec() snaps rung 1's
+    // `amt`: PACE_EASE is 3s, so a harness run that is only a few seconds of simulated dt
+    // would measure the feature part-way applied and report a much smaller effect than
+    // ships. A pinned value must mean what it says.
+    if (paceOv != null) webPace = paceOv;
+    else webPace += (paceTarget() - webPace) * Math.min(1, dt / PACE_EASE);
+    netTime += dt * webPace;
     shapeSpin += dt * (shp.spin||0) * (0.35 + bassSmooth*1.4 + beat*0.8);
     const figAng = (shp.spin||0) ? shapeSpin : Math.sin(netTime*1.2)*0.16*coh;
     const fcs = Math.cos(figAng), fsn = Math.sin(figAng);
@@ -2471,7 +2508,7 @@
       n.ax += dirx * hw * pull;
       n.ay += diry * hh * pull;
       // beats shove nodes outward (movement, never brightness); the release does it harder
-      const kick = (beat*beat*0.22 + burst*0.30) * cf;
+      const kick = (beat*beat*0.22 + burst*0.30) * cf * webPace;
       n.ax += dirx * kick * 2.4;
       n.ay += diry * kick * 2.4;
       // a little wander so a settled graph still breathes instead of freezing solid
@@ -2500,7 +2537,7 @@
       // life: inner nodes keep the quantum-vacuum flicker (a spark on each wink),
       // popping faster on their band; ring nodes stay lit.
       if (!n.ring){
-        n.tflip -= dt * (0.5 + n.e*2.2 + beat*2.5) * cf;
+        n.tflip -= dt * (0.5 + n.e*2.2 + beat*2.5) * cf * webPace;
         if (n.tflip <= 0){
           n.vtar = n.vtar > 0.5 ? 0 : 1;                // toggle presence
           n.flash = 1;                                  // spark on transition
@@ -2512,10 +2549,13 @@
     }
     // Rewire periodically (and on a hard hit). This is the visible payoff of the solver:
     // as nodes migrate, who they are connected to actually changes.
+    // Rewiring is the single most visible pace lever -- it is what makes the graph
+    // reorganise -- so a calm track stretches the interval rather than just drifting
+    // slower between identical rewires.
     relaxT -= dt;
     if (relaxT <= 0 || (beat > 0.7 && relaxT < 0.5)){
       rebuildEdges();
-      relaxT = 0.9 + Math.random()*0.8;
+      relaxT = (0.9 + Math.random()*0.8) / Math.max(0.2, webPace);
     }
 
     // ---- pack the instance streams (skip anything winked out; no sentinel padding) ----
@@ -4176,6 +4216,15 @@
     }
     if (P.has('env'))     envOn = P.get('env') !== '0';
     if (P.has('envbars')) envBars = Math.max(1, parseInt(P.get('envbars'),10) || 0);
+    // MOOD -> PACE. `?pace=1` is the A/B baseline (byte-identical to what shipped);
+    // anything else pins the scalar so it can be swept without needing a track whose
+    // arousal happens to land there. Guarded like ?c1=/?c2=: an unparseable value would
+    // otherwise yield NaN, and a NaN pace silently freezes the web's clock rather than
+    // throwing -- the same shape of failure as a NaN colour uniform.
+    if (P.has('pace')){
+      const v = parseFloat(P.get('pace'));
+      if (isFinite(v)) paceOv = Math.max(0.2, Math.min(2.0, v));
+    }
     // Observability: directed and undirected look similar on a steady passage, so a
     // silently-inert envelope would be indistinguishable from a subtle one. Same reason
     // __dirState exists.
