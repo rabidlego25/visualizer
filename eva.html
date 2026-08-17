@@ -485,6 +485,7 @@
   uniform float u_coh;          // 0..1 coalescence: background quiets so the figure reads
   uniform float u_coil;         // 0..1 tension winding up (build) -> brighter
   uniform float u_burst;        // 0..1 release exhale -> flash + outward pop
+  uniform float u_bgAng;        // integrated background rotation (never t*rate -- see bgPhase)
   const int MAXF = 24;          // silhouette outline points (closed polygon)
   uniform vec2  u_fig[MAXF];    // figure outline in uv space (already spun/placed by JS)
   uniform int   u_figN;         // active outline point count (0 = no figure)
@@ -553,7 +554,9 @@
 
     // --- AT-field hex grid ---
     float scale = 6.5 + u_bass*2.5;
-    float ang = t*0.07 + u_bass*0.5 + u_coil*0.6 + 0.25*sin(t*0.13);   // spins up as tension builds
+    // integrated in JS (see bgPhase) -- computing t*rate(audio) HERE teleported the field
+    // every time the audio moved, by an amount that grew with elapsed time
+    float ang = u_bgAng + 0.25*sin(t*0.13);
     mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
     vec2 huv = rot * uv * scale;
     vec4 hc = hexCoords(huv);
@@ -575,7 +578,9 @@
     // -> the field rotates individually, not in unison. Rate rises with the music.
     vec2 gv = huv - hc.zw;                              // local coord within this cell
     float cid = fract(sin(dot(hc.zw, vec2(12.9898,78.233)))*43758.5453);
-    float cang = t*(0.5 + cid*2.2)*(0.5 + u_bass*1.6 + u_coil*1.8) + cid*6.2831;  // spins up with tension
+    // per-cell rate still varies by hash (the field turns individually, not in unison),
+    // but off the INTEGRATED phase, so a bass swing changes speed instead of teleporting
+    float cang = u_bgAng*(1.6 + cid*7.0) + cid*6.2831;
     float pa = atan(gv.x, gv.y) + cang;                // rotate the glyph
     float pr = length(gv);
     float k = 6.2831/3.0;                              // 3 sides -> triangle
@@ -2391,6 +2396,23 @@
   // the honest A/B baseline.
   const PACE_EASE = 3.0;                  // seconds to take up a change in arousal
   let webPace = 1, paceOv = null;         // paceOv: ?pace= harness override
+
+  // ---------------- BACKGROUND ROTATION ----------------
+  // The AT-field and its per-cell glyphs used to compute their angle as `t * rate(audio)`
+  // inside FRAG_WEB. That is a PHASE JUMP generator, not a rotation: when the audio moves,
+  // the angle does not change speed, it teleports by `t * delta_rate` -- and the size of
+  // the jump grows linearly with how long the track has been playing. A minute in, an
+  // ordinary bass swing snapped the glyphs through several whole turns between one frame
+  // and the next, which is most of what read as "frantic". The hex field had the milder
+  // additive form of the same thing (`+ u_bass*0.5`), a bounded but constant jitter.
+  //
+  // The fix is to INTEGRATE: audio sets the rate, the phase accumulates, so the field can
+  // wind up and settle without ever discontinuing. Same discipline as shapeSpin, which was
+  // already written this way, and the reason it never suffered from this.
+  //
+  // Kept deliberately SLOW and independent of webPace: the background drifts, the web
+  // keeps its own speed. `?bgspin=` scales it (0 freezes the field, 1 ships).
+  let bgPhase = 0, bgSpin = 1;
   function paceTarget(){
     if (paceOv != null) return paceOv;
     const m = director.ready && director.tl ? director.tl.mood : null;
@@ -2432,7 +2454,13 @@
     if (paceOv != null) webPace = paceOv;
     else webPace += (paceTarget() - webPace) * Math.min(1, dt / PACE_EASE);
     netTime += dt * webPace;
-    shapeSpin += dt * (shp.spin||0) * (0.35 + bassSmooth*1.4 + beat*0.8);
+    // Background phase: rate from the audio, angle integrated. Not scaled by webPace --
+    // the field is meant to drift under the web, not keep step with it.
+    bgPhase += dt * (0.055 + bassSmooth*0.06 + coil*0.10) * bgSpin;
+    // The coalescence figure was already integrated correctly, but its audio coupling was
+    // strong enough that a beat visibly snapped it. Halved, and put on the same bgSpin so
+    // "how fast is the background" is one control rather than three.
+    shapeSpin += dt * (shp.spin||0) * (0.25 + bassSmooth*0.7 + beat*0.35) * bgSpin;
     const figAng = (shp.spin||0) ? shapeSpin : Math.sin(netTime*1.2)*0.16*coh;
     const fcs = Math.cos(figAng), fsn = Math.sin(figAng);
     // ---- force-directed relaxation --------------------------------------------
@@ -3205,6 +3233,7 @@
     gl.uniform1f(U(progWeb,'u_coh'), netOn ? coh : 0);
     gl.uniform1f(U(progWeb,'u_coil'), S.coil);
     gl.uniform1f(U(progWeb,'u_burst'), S.burst);
+    gl.uniform1f(U(progWeb,'u_bgAng'), bgPhase);
     gl.uniform2fv(U(progWeb,'u_fig'), figBuf);
     gl.uniform1i(U(progWeb,'u_figN'), figN);
     gl.uniform3fv(U(progWeb,'u_figA'), figA);
@@ -4277,6 +4306,11 @@
       if (P.has('title'))  titleIn.value  = P.get('title');
       if (P.has('artist')) artistIn.value = P.get('artist');
     }
+    // Background rotation + wink softness. Outside the !test guard on purpose: these are
+    // the two knobs the "too jumpy" report is about, so a harness has to be able to reach
+    // them. Guarded against NaN like ?c1=/?pace= -- a NaN phase would freeze the field and
+    // a NaN fade would leave every node stuck part-visible, neither of which throws.
+    if (P.has('bgspin')){ const v = parseFloat(P.get('bgspin')); if (isFinite(v)) bgSpin = Math.max(0, Math.min(4, v)); }
 
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
