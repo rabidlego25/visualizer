@@ -4242,6 +4242,42 @@
       bar: loopEnv.bar, p: +loopEnv.p.toFixed(4),
       sway: +loopEnv.sway.toFixed(4), rise: +loopEnv.rise.toFixed(4)
     });
+    // ---- LOOK PARAMS ON THE LIVE PATH ----
+    // These all existed already but only inside `?test=`, which meant a whole look could
+    // be pinned for a headless measurement and NOT for the one case that matters -- a
+    // human listening to a real track. Configuring a session was six clicks, so in
+    // practice it did not happen: every one of these shipped and stayed untried.
+    //
+    // The split is "is this a setting a user would choose, or a state pin for a harness".
+    // Everything here has a UI control and goes through the SAME setter the control does,
+    // so side effects (clearTrails, the slider relabel, the button captions) come with it
+    // and the UI never disagrees with the render. Measurement pins with no UI meaning
+    // (relax, warm, coil, burst, coh, shape, expo, nodes, nzoom, fwide...) stay test-only:
+    // they exist to freeze a state, and freezing a state during playback is not a look.
+    if (!P.has('test')){
+      if (P.has('hud')){
+        hudOn = P.get('hud') !== '0';
+        hudBtn.classList.toggle('primary', hudOn);
+        hudBtn.textContent = hudOn ? '▣ HUD' : '▣ HUD: Off';
+      }
+      if (P.has('trails')) setTrails(P.get('trails') !== '0');
+      if (P.has('density')){
+        const d = parseFloat(P.get('density'));
+        if (isFinite(d)) setDensity(Math.max(0, Math.min(1, d)));
+      }
+      if (P.has('theme')){
+        const ti = parseInt(P.get('theme'), 10);
+        // COVER_IDX may not exist yet (?art= decodes async), so clamp to what is really
+        // in the select rather than to THEMES.length
+        if (isFinite(ti) && themeSel.querySelector(`option[value="${ti}"]`)){
+          themeSel.value = String(ti);
+          themeSel.dispatchEvent(new Event('change'));
+        }
+      }
+      if (P.has('title'))  titleIn.value  = P.get('title');
+      if (P.has('artist')) artistIn.value = P.get('artist');
+    }
+
     if (P.has('test')) {
       const tp = (k,d) => { const v=P.get(k); return v===null ? d : parseFloat(v); };
       if (P.has('res')){ baseRes = Math.max(180, tp('res',1080)|0); resize(); }
