@@ -670,6 +670,115 @@
     return out;
   }
 
+  // ---- mood -----------------------------------------------------------------
+  // AROUSAL ONLY (calm <-> energetic), as ONE CONTINUOUS SCALAR. Deliberately not a
+  // classifier, for two reasons:
+  //   - The inputs are continuous and so are the consumers (drift rate, rewire cadence,
+  //     beat impulse). A discrete class in the middle loses information twice, once at
+  //     each conversion, and invents a decision boundary the data does not have. Same
+  //     lesson plan.js already learned scaling section labels by measured energy rather
+  //     than using them flat.
+  //   - It can be VALIDATED WITHOUT LABELLED GROUND TRUTH. "Is this song correctly
+  //     classified as melancholic" needs an annotated corpus and mood labels are noisy.
+  //     "Does this track score lower than that one" needs two tracks and an ordering the
+  //     listener already agrees with. For a solo project that difference decides it.
+  //
+  // VALENCE (sad <-> happy) is deliberately ABSENT. The only real audio cue is major/minor,
+  // already available in `key`, and it is weak on its own: Fireflies is melancholic in
+  // feel and in lyric but musically bright, major-key, mid-tempo synth-pop, so an
+  // audio-only valence estimate would disagree with the listener. The melancholy lives in
+  // the words and in association, and no transform of the waveform reaches either.
+  // Arousal is the axis that behaves, and it is the one that "make the visuals calmer for
+  // a calmer song" actually needs -- so the unreliable half is not on the path.
+  //
+  // Every cue is MASTERING-INDEPENDENT on purpose. Absolute loudness says more about the
+  // master than about the music (everything modern is limited to within a few dB), so
+  // level is not a cue here; density, ratio and brightness are.
+  //
+  // The thresholds are honest guesses awaiting calibration on real tracks, which is
+  // exactly why `cues` (what was measured) and `parts` (each cue's 0..1 contribution) are
+  // returned alongside the scalar. When the number disagrees with your ear you want to
+  // see WHICH cue misfired, not just that the answer was wrong -- the same discipline as
+  // plan.js surfacing `seamFixed` so a test can tell the rule fired rather than passing
+  // by luck.
+  function moodOf(tempo, onset, perc, harm, eLow, eMid, eHigh, F, fps){
+    const ramp = (v, a, b) => clamp((v - a) / (b - a), 0, 1);
+    const dur = F / fps;
+
+    // 1. Tempo. The most direct "fast/slow" cue there is -- but only when the grid is
+    //    trustworthy. Below the same 0.30 confidence every bar-locked path in this repo
+    //    refuses at, the BPM is guesswork, so the cue is dropped rather than believed.
+    const bpm = tempo && tempo.bpm ? tempo.bpm : 0;
+    const tempoOK = !!(tempo && tempo.conf > 0.30);
+
+    // 2. Onset density (events/sec). Rhythmic activity independent of how loud it is.
+    //    Peak-picked against the envelope's own mean, so it does not care about scale.
+    let om = 0;
+    for (let f = 0; f < F; f++) om += onset[f];
+    om /= Math.max(1, F);
+    let nOn = 0;
+    for (let f = 1; f < F - 1; f++){
+      if (onset[f] > om * 1.6 && onset[f] >= onset[f-1] && onset[f] > onset[f+1]) nOn++;
+    }
+    const onsetRate = dur > 0 ? nOn / dur : 0;
+
+    // 3. Percussive ratio. HPSS already separates them, so this is free: drums-forward
+    //    music reads energetic, sustained/legato material reads calm, and neither depends
+    //    on the master.
+    let pr = 0, prN = 0;
+    for (let f = 0; f < F; f++){
+      const d = perc[f] + harm[f];
+      if (d > 1e-9){ pr += perc[f] / d; prN++; }
+    }
+    pr = prN ? pr / prN : 0;
+
+    // THERE IS NO "PUNCH" CUE, and the reason is worth keeping. Two attempts:
+    //   - mean `beatStrength`, which is `onset/3` clamped to 1. It saturates on anything
+    //     with real transients and read 1.000 / 1.000 / 0.974 across three deliberately
+    //     different stimuli. A number that does not move when the thing it measures moves
+    //     is not measuring it.
+    //   - peak-to-mean: mean onset AT the tracked beats over the envelope's own mean.
+    //     Scale-free and unsaturated, but it came back 12.4 for the mid stimulus against
+    //     6.8 for the energetic one -- INVERTED. It measures sparseness, not energy: dense
+    //     music has onsets everywhere, so the floor rises and the hits stand out less.
+    // So it was never an arousal cue. Four independent cues that each discriminate beat a
+    // fifth that needed two redefinitions and still had to be argued into line -- that is
+    // fitting to the stimuli, not measuring the music.
+
+    // 4. Brightness. A coarse spectral centroid from bands the spectrogram already
+    //    computed. Dark and muted reads calm; present and bright reads energetic.
+    let br = 0, brN = 0;
+    for (let f = 0; f < F; f++){
+      const t = eLow[f] + eMid[f] + eHigh[f];
+      if (t > 1e-9){ br += eHigh[f] / t; brN++; }
+    }
+    br = brN ? br / brN : 0;
+
+    const parts = {
+      tempo:      ramp(bpm,        70,   150),
+      onset:      ramp(onsetRate,  1.2,  5.0),
+      percussive: ramp(pr,         0.25, 0.55),
+      bright:     ramp(br,         0.02, 0.30)
+    };
+    // Tempo and onset density dominate the perception of pace, so they carry more
+    // weight; brightness is the softest cue and carries least.
+    const W = { tempo: tempoOK ? 1.4 : 0, onset: 1.2, percussive: 1.0, bright: 0.6 };
+    let num = 0, den = 0;
+    for (const k in parts){ num += parts[k] * W[k]; den += W[k]; }
+
+    return {
+      arousal: +clamp(den > 0 ? num / den : 0.5, 0, 1).toFixed(4),
+      // what was actually measured, in interpretable units
+      cues: {
+        bpm: +bpm.toFixed(2), tempoUsed: tempoOK,
+        onsetRate: +onsetRate.toFixed(3), percussive: +pr.toFixed(3),
+        bright: +br.toFixed(4)
+      },
+      // each cue's 0..1 contribution, so a pinned or misfiring cue is visible at a glance
+      parts: Object.keys(parts).reduce((a, k) => (a[k] = +parts[k].toFixed(3), a), {})
+    };
+  }
+
   // ---- main -----------------------------------------------------------------
   function analyzeSong(o){
     const t0 = Date.now();
@@ -798,6 +907,8 @@
       tempo: { bpm: +tempo.bpm.toFixed(2), confidence: +tempo.conf.toFixed(3), meter,
                beatPeriod: +(60/tempo.bpm).toFixed(5) },
       key,
+      mood: moodOf(tempo, onset, hp.perc, hp.harm,
+                   sp.eLow, sp.eMid, sp.eHigh, F, fps),
       beats: beats.map(t => +t.toFixed(3)),
       beatStrength: beatStrength.map(v => +v.toFixed(3)),
       downbeats: downbeats.map(t => +t.toFixed(3)),
@@ -807,5 +918,5 @@
     };
   }
 
-  root.SongAnalysis = { analyzeSong, unpackEnv, packEnv, FFT, HOP, FFT_N };
+  root.SongAnalysis = { analyzeSong, unpackEnv, packEnv, moodOf, FFT, HOP, FFT_N };
 })(typeof self !== 'undefined' ? self : globalThis);
